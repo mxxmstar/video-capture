@@ -18,12 +18,14 @@
 do_build() {
     local BUILD_TYPE=$1
     local BUILD_TEST=$2
+    local ENABLE_MPP=${3:-OFF}
     
     echo "=========================================="
     echo "--- Build Script ---"
     echo "=========================================="
     echo "Build Type: $BUILD_TYPE"
     echo "Build Tests: $BUILD_TEST"
+    echo "Enable MPP: $ENABLE_MPP"
     echo "=========================================="
     
     # 创建build目录
@@ -36,10 +38,15 @@ do_build() {
         CMAKE_TEST_FLAG="-DBUILD_TESTS=ON"
     fi
     
+    local CMAKE_MPP_FLAG=""
+    if [ "$ENABLE_MPP" = "ON" ]; then
+        CMAKE_MPP_FLAG="-DENABLE_MPP=ON"
+    fi
+    
     # 配置CMake
     echo ""
     echo "Running CMake configuration..."
-    cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE $CMAKE_TEST_FLAG
+    cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE $CMAKE_TEST_FLAG $CMAKE_MPP_FLAG
     
     if [ $? -ne 0 ]; then
         echo "[ERROR] CMake configuration failed!"
@@ -60,7 +67,7 @@ do_build() {
     echo "=========================================="
     echo "Build successful!"
     echo "Output:"
-    echo "  - build/mpp_demo"
+    echo "  - build/video-capture"
     if [ "$BUILD_TEST" = "ON" ]; then
         echo "  - build/test_spdlog"
     fi
@@ -69,9 +76,9 @@ do_build() {
     # 显示生成的文件信息
     echo ""
     echo "Binary info:"
-    if [ -f mpp_demo ]; then
-        file mpp_demo
-        ls -lh mpp_demo
+    if [ -f video-capture ]; then
+        file video-capture
+        ls -lh video-capture
     fi
     if [ -f test_spdlog ]; then
         echo ""
@@ -105,8 +112,8 @@ do_clean() {
             echo "Cleaning main program..."
             cd build
             # 删除主程序相关文件
-            rm -f mpp_demo
-            rm -rf CMakeFiles/mpp_demo.dir
+            rm -f video-capture
+            rm -rf CMakeFiles/video-capture.dir
             # 清理 CMake 缓存（如果需要重新配置）
             rm -f CMakeCache.txt cmake_install.cmake Makefile
             rm -f CMakeFiles/*.log CMakeFiles/*.cache
