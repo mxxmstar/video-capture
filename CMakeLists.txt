@@ -16,19 +16,61 @@ option(BUILD_TESTS "Build test programs" ON)
 # 是否启用Rockchip MPP模块（默认关闭）
 option(ENABLE_MPP "Enable Rockchip MPP module" OFF)
 
+# ============================================================
+# FFmpeg 配置（仅 Windows 平台）
+# ============================================================
+if(WIN32)
+    set(FFMPEG_ROOT ${CMAKE_SOURCE_DIR}/third_party/ffmpeg-8.1)
+    set(FFMPEG_INCLUDE_DIR ${FFMPEG_ROOT}/include)
+    set(FFMPEG_LIB_DIR ${FFMPEG_ROOT}/lib)
+
+    set(FFMPEG_LIBRARIES
+        ${FFMPEG_LIB_DIR}/avcodec.lib
+        ${FFMPEG_LIB_DIR}/avformat.lib
+        ${FFMPEG_LIB_DIR}/avutil.lib
+        ${FFMPEG_LIB_DIR}/swscale.lib
+        ${FFMPEG_LIB_DIR}/swresample.lib
+        ${FFMPEG_LIB_DIR}/avfilter.lib
+        ${FFMPEG_LIB_DIR}/avdevice.lib
+    )
+endif()
+
+# ============================================================
+# ASIO (header-only)
+# ============================================================
+set(ASIO_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/asio-1.36.0)
+add_library(asio INTERFACE IMPORTED)
+target_include_directories(asio INTERFACE ${ASIO_INCLUDE_DIR})
+target_compile_definitions(asio INTERFACE ASIO_STANDALONE)
+
+# ============================================================
+# spdlog (header-only)
+# ============================================================
+set(SPDLOG_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/third_party/spdlog-1.17.0/include)
+add_library(spdlog INTERFACE IMPORTED)
+target_include_directories(spdlog INTERFACE ${SPDLOG_INCLUDE_DIR})
+
 # 加载工具链和 SDK 配置（仅Linux平台）
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(${CMAKE_SOURCE_DIR}/cmake/toolchain_config.cmake)
 else()
     # Windows平台需要单独定义第三方库路径
     set(THIRD_PARTY_INCLUDE_DIRS
-        ${CMAKE_SOURCE_DIR}/third_party/spdlog-1.17.0/include
+        ${SPDLOG_INCLUDE_DIR}
+        ${FFMPEG_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/third_party/pcap/Include
     )
 endif()
 
 # 包含头文件路径
+# 项目内部头文件（include/ 目录）
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
 if(ENABLE_MPP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include_directories(${MPP_INCLUDE_DIRS})
+endif()
+if(WIN32)
+    include_directories(${FFMPEG_INCLUDE_DIR})
 endif()
 include_directories(${THIRD_PARTY_INCLUDE_DIRS})
 
@@ -37,15 +79,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     link_directories(${LIBRARY_DIRS})
 endif()
 
+# 收集所有源文件
+file(GLOB_RECURSE SOURCES
+    "${CMAKE_SOURCE_DIR}/src/*.cpp"
+)
+
 # 定义可执行文件
-add_executable(video-capture ${CMAKE_SOURCE_DIR}/src/main.cpp)
+add_executable(video-capture ${SOURCES})
+
+# 链接 asio 和 spdlog（header-only 库）
+target_link_libraries(video-capture asio spdlog)
 
 # 根据平台链接不同的库
 if(WIN32)
     # Windows平台链接库
     target_link_libraries(video-capture
         ws2_32      # Windows Socket
+        ${FFMPEG_LIBRARIES}
     )
+    
+    # 将 FFmpeg DLL 复制到输出目录
+    file(GLOB FFMPEG_DLLS "${FFMPEG_ROOT}/bin/*.dll")
+    add_custom_command(TARGET video-capture POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${FFMPEG_DLLS}
+            $<TARGET_FILE_DIR:video-capture>
+        COMMENT "Copying FFmpeg DLLs to output directory"
+    )
+    
     message(STATUS "Platform: Windows")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Linux平台链接库
@@ -93,8 +154,8 @@ if(BUILD_TESTS)
     # spdlog 测试
     add_executable(test_spdlog ${CMAKE_SOURCE_DIR}/test/test_spdlog.cpp)
     
-    # 包含 spdlog 头文件路径
-    target_include_directories(test_spdlog PRIVATE ${THIRD_PARTY_INCLUDE_DIRS})
+    # 链接 spdlog（header-only 库）
+    target_link_libraries(test_spdlog spdlog)
     
     # 根据平台链接不同的库
     if(WIN32)
