@@ -84,49 +84,34 @@ file(GLOB_RECURSE SOURCES
     "${CMAKE_SOURCE_DIR}/src/*.cpp"
 )
 
-# 定义可执行文件
-add_executable(video-capture ${SOURCES})
+# 定义静态库（供可执行文件和测试使用）
+add_library(video_capture_lib STATIC ${SOURCES})
+target_link_libraries(video_capture_lib asio spdlog)
 
-# 链接 asio 和 spdlog（header-only 库）
-target_link_libraries(video-capture asio spdlog)
-
-# 根据平台链接不同的库
 if(WIN32)
-    # Windows平台链接库
-    target_link_libraries(video-capture
-        ws2_32      # Windows Socket
-        ${FFMPEG_LIBRARIES}
-    )
-    
-    # 将 FFmpeg DLL 复制到输出目录
+    target_link_libraries(video_capture_lib ws2_32 ${FFMPEG_LIBRARIES})
     file(GLOB FFMPEG_DLLS "${FFMPEG_ROOT}/bin/*.dll")
-    add_custom_command(TARGET video-capture POST_BUILD
+    add_custom_command(TARGET video_capture_lib POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${FFMPEG_DLLS}
-            $<TARGET_FILE_DIR:video-capture>
-        COMMENT "Copying FFmpeg DLLs to output directory"
+            ${CMAKE_BINARY_DIR}
+        COMMENT "Copying FFmpeg DLLs to build directory"
     )
-    
     message(STATUS "Platform: Windows")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # Linux平台链接库
-    target_link_libraries(video-capture
-        pthread
-        dl
-    )
-    
-    # 如果启用了MPP模块，链接Rockchip MPP库
+    target_link_libraries(video_capture_lib pthread dl)
     if(ENABLE_MPP)
-        target_link_libraries(video-capture
-            rockchip_mpp
-        )
+        target_link_libraries(video_capture_lib rockchip_mpp)
         message(STATUS "MPP Module: Enabled")
     else()
         message(STATUS "MPP Module: Disabled (set ENABLE_MPP=ON to enable)")
     endif()
-    
     message(STATUS "Platform: Linux")
 endif()
+
+# 定义可执行文件
+add_executable(video-capture src/main.cpp)
+target_link_libraries(video-capture video_capture_lib)
 
 # 编译选项 - 根据平台添加调试信息和警告
 if(MSVC)
@@ -150,21 +135,8 @@ endif()
 # 是否编译测试
 if(BUILD_TESTS)
     message(STATUS "Building tests: ON")
-    
-    # spdlog 测试
-    add_executable(test_spdlog ${CMAKE_SOURCE_DIR}/test/test_spdlog.cpp)
-    
-    # 链接 spdlog（header-only 库）
-    target_link_libraries(test_spdlog spdlog)
-    
-    # 根据平台链接不同的库
-    if(WIN32)
-        target_link_libraries(test_spdlog ws2_32)
-    else()
-        target_link_libraries(test_spdlog pthread)
-    endif()
-    
-    message(STATUS "Test targets: test_spdlog")
+    add_subdirectory(test)
+    message(STATUS "Test targets: test_spdlog, test_stream_decode")
 else()
     message(STATUS "Building tests: OFF (set BUILD_TESTS=ON to enable)")
 endif()

@@ -43,7 +43,11 @@ struct MediaStreamInfo {
     Rational time_base{1, 1000000}; ///< 时间基（微秒/单位）
     std::vector<uint8_t> extra_data; ///< 额外数据（如 H.264 SPS/PPS）
     std::variant<VideoStreamInfo, AudioStreamInfo> detail;
-    
+
+    /// @brief 获取指定类型的详细信息
+    template<typename T>
+    const T& get_detail() const { return std::get<T>(detail); }
+
     /// @brief 打印流信息到日志
     void Dump(bool dump_extra_data = true) const {
         LOG_INFO("StreamInfo: {}", media_type == MediaType::VIDEO ? "VIDEO" : "AUDIO");

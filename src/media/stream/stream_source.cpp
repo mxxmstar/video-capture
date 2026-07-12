@@ -33,7 +33,7 @@ bool MediaStreamSource::Start() {
     // 应用配置到 session 和 puller
     ApplyConfig();
 
-    // 桥接 session 回调 → source 回调
+    // 桥接 session 回调 -> source 回调
     {
         std::lock_guard<std::mutex> lock(cb_mutex_);
         session_->SetStreamInfoCallback(
@@ -91,7 +91,7 @@ void MediaStreamSource::OnPacket(std::shared_ptr<MediaPacket> packet) {
     if (!packet)
         return;
 
-    packet->Dump();
+    // packet->Dump();
     // 更新统计
     if (packet->type == MediaType::VIDEO) {
         video_packet_count_.fetch_add(1, std::memory_order_relaxed);

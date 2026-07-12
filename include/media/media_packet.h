@@ -20,13 +20,14 @@ enum class MediaType {
 /// 编码格式（值参考 FFmpeg 的 AVCodecID）
 enum class CodecType : int {
     UNKNOWN = 0,
-    H264    = 7,
-    H265    = 12,
-    AAC     = 15,
-    G711A   = 7,
-    G711U   = 8,
-    OPUS    = 31,
-    JPEG    = 26,  // JPEG/MJPEG
+    H264    = 27,   // AV_CODEC_ID_H264
+    H265    = 173,  // AV_CODEC_ID_HEVC
+    AAC     = 86018,// AV_CODEC_ID_AAC
+    OPUS    = 86097,// AV_CODEC_ID_OPUS
+    G711A   = 65543,// AV_CODEC_ID_PCM_ALAW
+    G711U   = 65542,// AV_CODEC_ID_PCM_MULAW
+    G726    = 69643,// AV_CODEC_ID_ADPCM_G726
+    JPEG    = 7,    // AV_CODEC_ID_MJPEG
 };
 
 /// 后端引擎句柄，用于传递特定引擎的内部对象指针

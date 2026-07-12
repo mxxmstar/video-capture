@@ -372,6 +372,12 @@ CodecType FFmpegPuller::MapCodecID(AVCodecID id) {
         case AV_CODEC_ID_HEVC: return CodecType::H265;
         case AV_CODEC_ID_AAC:  return CodecType::AAC;
         case AV_CODEC_ID_OPUS: return CodecType::OPUS;
-        default:               return CodecType::UNKNOWN;
+        case AV_CODEC_ID_PCM_ALAW:    return CodecType::G711A;
+        case AV_CODEC_ID_PCM_MULAW:   return CodecType::G711U;
+        case AV_CODEC_ID_ADPCM_G726:  return CodecType::G726;
+        case AV_CODEC_ID_MJPEG:       return CodecType::JPEG;
+        default:
+            LOG_WARN("Unknown codec ID: {}", static_cast<int>(id));
+            return CodecType::UNKNOWN;
     }
 }
