@@ -81,4 +81,83 @@ public:
 
     std::shared_ptr<IMediaBuffer> buffer;           ///< packed 图像数据
     BackendHandle backend;                          ///< 后端引擎句柄
+
+    /// @brief 获取视频元数据（若 type 为 VIDEO）
+    const VideoFrameMeta* VideoMeta() const {
+        if (type == MediaType::VIDEO) {
+            return &std::get<VideoFrameMeta>(meta);
+        }
+        return nullptr;
+    }
+
+    /// @brief 获取音频元数据（若 type 为 AUDIO）
+    const AudioFrameMeta* AudioMeta() const {
+        if (type == MediaType::AUDIO) {
+            return &std::get<AudioFrameMeta>(meta);
+        }
+        return nullptr;
+    }
+
+    /// @brief 获取视频宽度
+    int32_t Width() const {
+        if (auto* v = VideoMeta()) return v->width;
+        return 0;
+    }
+
+    /// @brief 获取视频高度
+    int32_t Height() const {
+        if (auto* v = VideoMeta()) return v->height;
+        return 0;
+    }
+
+    /// @brief 获取像素格式
+    PixelFormat GetPixelFormat() const {
+        if (auto* v = VideoMeta()) return v->pixel_format;
+        return PixelFormat::kUnknown;
+    }
+
+    /// @brief 获取平面数量
+    int32_t PlaneCount() const {
+        if (auto* v = VideoMeta()) return v->plane_count;
+        if (auto* a = AudioMeta()) return a->plane_count;
+        return 0;
+    }
+
+    /// @brief 获取指定平面的 stride
+    int32_t Stride(int index) const {
+        if (auto* v = VideoMeta()) return v->plane_info[index].stride;
+        if (auto* a = AudioMeta()) return a->planes[index].stride;
+        return 0;
+    }
+
+    /// @brief 获取指定平面的 offset
+    int32_t PlaneOffset(int index) const {
+        if (auto* v = VideoMeta()) return v->plane_info[index].offset;
+        if (auto* a = AudioMeta()) return a->planes[index].offset;
+        return 0;
+    }
+
+    /// @brief 获取样本数（音频）
+    int NbSamples() const {
+        if (auto* a = AudioMeta()) return a->nb_samples;
+        return 0;
+    }
+
+    /// @brief 获取采样率（音频）
+    int SampleRate() const {
+        if (auto* a = AudioMeta()) return a->sample_rate;
+        return 0;
+    }
+
+    /// @brief 获取通道数（音频）
+    int Channels() const {
+        if (auto* a = AudioMeta()) return a->channels;
+        return 0;
+    }
+
+    /// @brief 获取采样格式（音频）
+    SampleFormat SampleFmt() const {
+        if (auto* a = AudioMeta()) return a->sample_format;
+        return SampleFormat::Unknown;
+    }
 };
