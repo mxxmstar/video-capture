@@ -37,6 +37,9 @@ endforeach()
 
 if(BUILD_MEDIA_TESTS)
     add_subdirectory(media)
+    if(BUILD_V4L2_CAPTURE)
+        add_subdirectory(capture)
+    endif()
 endif()
 
 if(BUILD_RENDER)

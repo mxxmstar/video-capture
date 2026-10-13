@@ -18,6 +18,7 @@ inline AVPixelFormat ToAVPixelFormat(PixelFormat format) {
         case PixelFormat::kBGR24: return AV_PIX_FMT_BGR24;
         case PixelFormat::kRGB24: return AV_PIX_FMT_RGB24;
         case PixelFormat::kGRAY8: return AV_PIX_FMT_GRAY8;
+        case PixelFormat::kYUYV422: return AV_PIX_FMT_YUYV422;
         default:                 return AV_PIX_FMT_NONE;
     }
 }
@@ -50,6 +51,7 @@ inline PixelFormat FromAVPixelFormat(AVPixelFormat format) {
         case AV_PIX_FMT_BGR24:   return PixelFormat::kBGR24;
         case AV_PIX_FMT_RGB24:   return PixelFormat::kRGB24;
         case AV_PIX_FMT_GRAY8:   return PixelFormat::kGRAY8;
+        case AV_PIX_FMT_YUYV422: return PixelFormat::kYUYV422;
         default:                 return PixelFormat::kUnknown;
     }
 }

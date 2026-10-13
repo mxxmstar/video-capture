@@ -54,6 +54,16 @@ find_package(spdlog CONFIG REQUIRED)
 
 option(BUILD_RENDER "Build the render module" ON)
 
+set(DEFAULT_BUILD_V4L2_CAPTURE OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(DEFAULT_BUILD_V4L2_CAPTURE ON)
+endif()
+option(BUILD_V4L2_CAPTURE "Build native Linux V4L2 capture" ${DEFAULT_BUILD_V4L2_CAPTURE})
+if(BUILD_V4L2_CAPTURE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Native V4L2 capture requires Linux")
+endif()
+find_package(Threads REQUIRED)
+
 # 保留 packed 路径作为性能对照组；切换为 ON 时启用 raw AVFrame 路径。
 option(MEDIA_RAW_FRAME_BUFFER "Use non-copying raw AVFrame media buffers" OFF)
 
@@ -91,7 +101,11 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/render/.*\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/media/stream/stream_source\\.cpp$")
 
 # 创建静态库
+if(NOT BUILD_V4L2_CAPTURE)
+    list(FILTER SOURCES EXCLUDE REGEX ".*/media/capture/.*\\.cpp$")
+endif()
 add_library(common_lib STATIC ${SOURCES})
+target_link_libraries(common_lib PUBLIC Threads::Threads)
 
 # 设置头文件包含目录
 target_include_directories(common_lib

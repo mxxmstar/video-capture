@@ -18,6 +18,7 @@ enum class PixelFormat {
     kBGR24,    ///< BGR 24 位
     kRGB24,    ///< RGB 24 位
     kGRAY8,    ///< 8 位灰度
+    kYUYV422,  ///< Packed Y0 U0 Y1 V0, 4:2:2
 };
 
 /// @brief 音频采样格式
@@ -45,8 +46,27 @@ struct MediaTime {
 /// @brief 平面信息
 struct PlaneInfo {
     int32_t offset{0}; ///< 平面数据偏移（字节）
-    int32_t stride{0}; ///< 平面行跨度（字节）  
+    int32_t stride{0}; ///< 平面行跨度（字节）
     int32_t size{0};     ///< 平面数据大小（字节）
+};
+
+/// @brief 带 stride 填充的源缓冲区中单个平面的布局参数
+struct StridedPlaneEntry {
+    int rows = 0;               ///< 本平面行数
+    int row_bytes = 0;          ///< 每行有效字节数（不含填充）
+    int source_stride = 0;      ///< 缓冲区行跨度（含填充）
+    std::size_t source_offset = 0; ///< 本平面在源缓冲区中的字节偏移
+};
+
+/// @brief 带 stride 填充的源缓冲区的完整平面布局
+struct SourcePlaneLayout {
+    int plane_count = 0;
+    StridedPlaneEntry planes[3];
+
+    bool is_empty() const { return plane_count <= 0; }
+
+    /// 根据像素格式、宽高和源行跨度计算各平面的布局参数
+    static SourcePlaneLayout Compute(PixelFormat format, int width, int height, int source_stride);
 };
 
 /// @brief struct VideoFrameMeta 视频帧元数据
@@ -72,18 +92,56 @@ struct AudioFrameMeta {
 
 using FrameMeta = std::variant<VideoFrameMeta, AudioFrameMeta>;
 
+/// @brief 紧凑帧中单个平面的视图
+struct PlaneSlice {
+    const uint8_t* data = nullptr; ///< 平面起始地址
+    int stride = 0;               ///< 行跨度（字节）
+    int row_bytes = 0;            ///< 每行有效像素字节数
+    int rows = 0;                 ///< 本平面行数
+};
+
 /// 媒体帧：解码后的图像数据及其描述信息
 class MediaFrame {
 public:
     MediaType    type{MediaType::VIDEO};              ///< 媒体类型（VIDEO/AUDIO）
     MediaTime   time;                               ///< 时间戳信息
-    FrameMeta meta;                                 ///< 媒体帧元数据            
+    FrameMeta meta;                                 ///< 媒体帧元数据
 
     // 普通帧通常由 SimpleBuffer 持有连续数据；FFmpeg 后端帧也可以由
     // FFmpegRawFrameBuffer 持有多平面 AVFrame，此时不能通过 Data()/Size()
     // 访问整帧，而应使用 backend.ptr 或 raw buffer 的平面接口。
     std::shared_ptr<IMediaBuffer> buffer;           ///< 媒体数据缓冲区
     BackendHandle backend;                          ///< 所有权句柄
+
+    /// @brief 将带 stride 填充的源数据紧凑打包为自描述的 MediaFrame（零拷贝版本）
+    /// 源数据由 shared_ptr 持有所有权。当布局已满足紧凑条件
+    /// （各 plane stride==row_bytes 且平面间连续）时，直接包装为 SimpleBufferView 跳过 memcpy；
+    /// 否则从 shared_ptr 读取并拷贝到 SimpleBuffer。
+    /// @param source_data  拥有源数据所有权的 shared_ptr
+    /// @param source_bytes 源缓冲区总大小
+    /// @param format       像素格式
+    /// @param width        帧宽度（像素）
+    /// @param height       帧高度（像素）
+    /// @param source_stride 源数据行跨度（含对齐填充）
+    static std::shared_ptr<MediaFrame> CreateCompact(std::shared_ptr<const uint8_t> source_data, std::size_t source_bytes,
+        PixelFormat format, int width, int height, int source_stride);
+
+    /// @brief 纯拷贝版本：原始指针 + 不做所有权假设，始终 memcpy
+    static std::shared_ptr<MediaFrame> CreateCompact(const unsigned char* source_data, std::size_t source_bytes,
+        PixelFormat format, int width, int height, int source_stride);
+
+    /// @brief 拷贝到外部预分配缓冲区，返回的 MediaFrame 通过 SimpleBufferView 引用目标内存
+    ///       调用方需保证 dest 在帧存活期间有效
+    /// @param dest          预分配的目标缓冲区
+    /// @param dest_capacity 目标缓冲区容量，必须 >= 紧凑格式所需大小
+    /// @return nullptr 表示参数非法或容量不足
+    static std::shared_ptr<MediaFrame> CreateCompact(const unsigned char* source_data, std::size_t source_bytes,
+        PixelFormat format, int width, int height, int source_stride,
+        uint8_t* dest, std::size_t dest_capacity);
+
+    /// @brief 从紧凑 MediaFrame 中解析指定平面的视图
+    /// @return PlaneSlice，若 index 越界或元数据无效则 data 为 nullptr
+    PlaneSlice GetPlaneSlice(int plane_index) const;
 
     /// @brief 获取视频元数据（若 type 为 VIDEO）
     const VideoFrameMeta* VideoMeta() const {
