@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+#include <linux/dma-heap.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -614,10 +615,186 @@ int v4l2_multiplane_dma_demo(int argc, char* argv[]) {
     return failed ? 1 : 0;
 }
 
+int v4l2_multiplane_dma_heap_demo(int argc, char* argv[]) {
+
+    const char *device = argc > 1 ? argv[1] : "/dev/video1";
+    const int max_frames = argc > 2 ? std::stoi(argv[2]) : -1;
+    const bool strict_import = argc > 3 && std::string(argv[3]) == "--require-import";
+
+    // 打开设备
+    int fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+    {
+        std::cerr << "open " << device << " failed: " << strerror(errno) << '\n';
+        return 1;
+    }
+    // 查询设备能力
+    v4l2_capability cap{};
+    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
+    PrintCapability(cap);
+    auto caps = DeviceCaps(cap);
+    if (!(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) || !(caps & V4L2_CAP_STREAMING))
+    {
+        close(fd);
+        return 1;
+    }
+    // 设置视频格式
+    auto [width, height, np, stride, fmt] = SetupMultiPlaneFormat(fd);
+    (void)stride;
+    if (np != 3 || fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420M)
+    {
+        close(fd);
+        return 1;
+    }
+    // 打开DMA堆
+    int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+    if (heap < 0)
+    {
+        std::cerr << "open dma heap failed: " << strerror(errno) << '\n';
+        close(fd);
+        return 1;
+    }
+    // 请求缓冲区
+    v4l2_requestbuffers req{};
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req.memory = V4L2_MEMORY_DMABUF;
+    req.count = REQ_BUF_COUNT;
+    xioctl(fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS(DMABUF)");
+    struct HeapBuf
+    {
+        std::array<int, VIDEO_MAX_PLANES> fd{};
+        std::array<size_t, VIDEO_MAX_PLANES> size{};
+        ~HeapBuf()
+        {
+            for (int x : fd)
+                if (x >= 0)
+                    close(x);
+        }
+        HeapBuf()
+        {
+            fd.fill(-1);
+            size.fill(0);
+        }
+        HeapBuf(const HeapBuf &) = delete;
+        HeapBuf &operator=(const HeapBuf &) = delete;
+    };
+    std::vector<HeapBuf> bufs(req.count);
+    for (unsigned i = 0; i < req.count; ++i)
+        for (int p = 0; p < np; ++p)
+        {
+            dma_heap_allocation_data a{};
+            a.len = fmt.fmt.pix_mp.plane_fmt[p].sizeimage;
+            a.fd_flags = O_RDWR | O_CLOEXEC;
+            if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a) < 0)
+                throw std::runtime_error("DMA_HEAP_IOCTL_ALLOC: " + std::string(strerror(errno)));
+            bufs[i].fd[p] = a.fd;
+            bufs[i].size[p] = a.len;
+        }
+    close(heap);
+    auto queue = [&](unsigned i) { 
+        v4l2_plane pl[VIDEO_MAX_PLANES]{};
+        v4l2_buffer b{};
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_DMABUF;
+        b.index=i;
+        b.length=np;
+        b.m.planes=pl;
+        for(int p = 0; p < np; ++p) {
+            pl[p].m.fd = bufs[i].fd[p];
+            pl[p].length = bufs[i].size[p];
+        } 
+        xioctl(fd,VIDIOC_QBUF,&b,"VIDIOC_QBUF(DMABUF)"); 
+    };
+    for (unsigned i = 0; i < req.count; ++i) {
+        queue(i);
+    }
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    StartStreaming(fd, type);
+    render::OpenGLVideoRenderer renderer;
+    if (!InitRenderer(renderer, width, height, "V4L2 DMA-Heap + OpenGL Demo", fd, type))
+        return 1;
+    int frames = 0;
+    bool failed = false;
+    std::cout << "capturing... (press ESC to quit)\n";
+    while (!renderer.ShouldClose() && (max_frames < 0 || frames < max_frames))
+    {
+        auto ps = PollDevice(fd, 100);
+        if (ps == PollStatus::Error || ps == PollStatus::DeviceError)
+        {
+            failed = true;
+            break;
+        }
+        if (ps != PollStatus::Ready)
+        {
+            renderer.PollEvents();
+            continue;
+        }
+        v4l2_plane pl[VIDEO_MAX_PLANES]{};
+        v4l2_buffer b{};
+        b.type = type;
+        b.memory = V4L2_MEMORY_DMABUF;
+        b.length = np;
+        b.m.planes = pl;
+        if (ioctl(fd, VIDIOC_DQBUF, &b) < 0)
+        {
+            if (errno == EAGAIN || errno == EINTR)
+                continue;
+            failed = true;
+            break;
+        }
+        if (b.index >= bufs.size())
+        {
+            failed = true;
+            break;
+        }
+        if (b.flags & V4L2_BUF_FLAG_ERROR)
+        {
+            queue(b.index);
+            continue;
+        }
+        render::DmaBufVideoFrame frame;
+        frame.width = width;
+        frame.height = height;
+        frame.format = PixelFormat::kI420;
+        for (int p = 0; p < np; ++p)
+        {
+            if (pl[p].bytesused > bufs[b.index].size[p])
+            {
+                failed = true;
+                break;
+            }
+            frame.planes.push_back({bufs[b.index].fd[p], 0, (int)fmt.fmt.pix_mp.plane_fmt[p].bytesperline, bufs[b.index].size[p]});
+        }
+        if (failed)
+        {
+            queue(b.index);
+            break;
+        }
+        PrintTimestampClock(b, frames);
+        if (!renderer.RenderDmaBuf(frame, !strict_import))
+        {
+            std::cerr << "render failed: " << renderer.LastError() << '\n';
+            failed = true;
+            queue(b.index);
+            break;
+        }
+        ++frames;
+        if (frames == 1)
+            std::cout << "DMA-BUF render path: " << (renderer.LastDmaBufWasImported() ? "EGLImage import" : "CPU mmap + plane texture upload") << '\n'
+                      << renderer.DmaBufImportError() << '\n';
+        queue(b.index);
+        renderer.PollEvents();
+    }
+    std::cout << "stopping... rendered " << frames << " frames\n";
+    StopStreamingAndClose(fd, type);
+    renderer.Shutdown();
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char* argv[]) {
     // return v4l2_demo(argc, argv);
     try {
-        return v4l2_multiplane_dma_demo(argc, argv);
+        return v4l2_multiplane_dma_heap_demo(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
