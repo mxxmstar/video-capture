@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <vector>
 #include <poll.h>
+#include <algorithm>
+#include <limits>
 #define REQ_BUF_COUNT 4
 
 struct VideoBuffer {
@@ -71,6 +73,22 @@ struct MultiPlaneVideoBuffer {
     MultiPlaneVideoBuffer& operator=(MultiPlaneVideoBuffer&&) noexcept = default;
 };
 
+struct ExportedBuffer {
+    int dma_fds[VIDEO_MAX_PLANES];
+    int num_planes = 0;
+    ExportedBuffer() { std::fill(std::begin(dma_fds), std::end(dma_fds), -1); }
+    ExportedBuffer(const ExportedBuffer&) = delete;
+    ExportedBuffer& operator=(const ExportedBuffer&) = delete;
+    ~ExportedBuffer() {
+        for (int fd : dma_fds) {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    }
+};
+
+
 namespace {
 
 void xioctl(int fd, unsigned long request, void* arg, const char* name) {
@@ -79,542 +97,529 @@ void xioctl(int fd, unsigned long request, void* arg, const char* name) {
     }
 }
 
-} // namespace
+// ---- 共享工具函数 ----
 
-int v4l2_demo(int argc, char* argv[]) {
-    const char* device = (argc > 1) ? argv[1] : "/dev/video0";
-
-    // ================================================================
-    //  1. OPEN
-    // ================================================================
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        std::cerr << "open " << device << " failed: " << strerror(errno) << std::endl;
-        return 1;
-    }
-
-    // ================================================================
-    //  2. QUERYCAP
-    // ================================================================
-    v4l2_capability cap{};
-    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
-
-    std::cout << "driver:  " << cap.driver  << std::endl;
-    std::cout << "card:    " << cap.card    << std::endl;
-    std::cout << "bus:     " << cap.bus_info << std::endl;
-    std::cout << "capture: " << ((cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)  ? "YES" : "NO") << std::endl;
-    std::cout << "stream:  " << ((cap.capabilities & V4L2_CAP_STREAMING)      ? "YES" : "NO") << std::endl;
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        std::cerr << "device does not support capture" << std::endl;
-        close(fd);
-        return 1;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        std::cerr << "device does not support streaming" << std::endl;
-        close(fd);
-        return 1;
-    }
-    // ================================================================
-    //  3. S_FMT
-    // ================================================================
-    v4l2_format fmt{};
-    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    // fmt.fmt.pix.width       = 640;
-    // fmt.fmt.pix.height      = 480;
-    fmt.fmt.pix.width       = 1920;
-    fmt.fmt.pix.height      = 1080;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
-
-    xioctl(fd, VIDIOC_S_FMT, &fmt, "VIDIOC_S_FMT");
-
-    // 回读校验
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
-        std::cout << "driver returned different pixfmt: " << (int)fmt.fmt.pix.pixelformat << std::endl;
-    }
-    if (fmt.fmt.pix.width  != 640 || fmt.fmt.pix.height != 480) {
-        std::cout << "driver adjusted size to " << fmt.fmt.pix.width << "x" << fmt.fmt.pix.height << std::endl;
-    }
-
-    int width  = fmt.fmt.pix.width;
-    int height = fmt.fmt.pix.height;
-    int stride = fmt.fmt.pix.bytesperline;
-    std::cout << "format:  " << width << "x" << height
-              << "  stride=" << stride << "  size=" << fmt.fmt.pix.sizeimage << std::endl;
-
-    // ================================================================
-    //  4. REQBUFS
-    // ================================================================
-    v4l2_requestbuffers req{};
-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    req.count  = REQ_BUF_COUNT;
-    xioctl(fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS");
-    std::cout << "buffers: " << req.count << std::endl;
-
-    // ================================================================
-    //  5. QUERYBUF + mmap
-    // ================================================================
-    std::vector<VideoBuffer> buffers(req.count);
-    for (unsigned i = 0; i < req.count; ++i) {
-        v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index  = i;
-        xioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");
-
-        buffers[i].length = buf.length;
-        buffers[i].start = mmap(nullptr, buf.length,
-                                PROT_READ | PROT_WRITE, MAP_SHARED,
-                                fd, buf.m.offset);
-        if (buffers[i].start == MAP_FAILED) {
-            throw std::runtime_error(std::string("mmap: ") + strerror(errno));
-        }
-        std::cout << "buf[" << i << "] addr=" << buffers[i].start
-                  << " len=" << buffers[i].length << std::endl;
-    }
-
-    // ================================================================
-    //  6. QBUF（入队，让内核填充数据）
-    // ================================================================
-    for (unsigned i = 0; i < req.count; ++i) {
-        v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index  = i;
-        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-    }
-
-    // ================================================================
-    //  7. STREAMON
-    // ================================================================
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(fd, VIDIOC_STREAMON, &type, "VIDIOC_STREAMON");
-    std::cout << "stream ON" << std::endl;
-
-    // ================================================================
-    //  8. OpenGL 渲染器初始化
-    // ================================================================
-    render::RenderConfig render_config;
-    render_config.window_width  = width;
-    render_config.window_height = height;
-    render_config.title         = "V4L2 Raw + OpenGL Demo";
-    render_config.vsync         = false;
-
-    render::OpenGLVideoRenderer renderer;
-    if (!renderer.Init(render_config)) {
-        std::cerr << "renderer init failed: " << renderer.LastError() << std::endl;
-        xioctl(fd, VIDIOC_STREAMOFF, &type, "VIDIOC_STREAMOFF");
-        close(fd);
-        return 1;
-    }
-
-    // YUYV -> I420 converter（OpenGLVideoRenderer 原生支持 I420）
-    MediaFrameConverter converter;
-    {
-        MediaFrameConverterConfig conv_cfg;
-        conv_cfg.video = {static_cast<int32_t>(width),
-                          static_cast<int32_t>(height),
-                          PixelFormat::kI420, 2};
-        if (!converter.Open(conv_cfg)) {
-            throw std::runtime_error("converter open failed");
-        }
-    }
-
-    // ================================================================
-    //  9. 主循环：DQBUF -> 转换 -> Render -> QBUF
-    // ================================================================
-    int frame_count = 0;
-    std::cout << "capturing... (press ESC to quit)" << std::endl;
-    pollfd pfd{};
-    pfd.fd = fd;
-    pfd.events = POLLIN;    // 监听读事件
-
-    while (!renderer.ShouldClose()) {
-        int poll_ret = poll(&pfd, 1, 100);
-        if (poll_ret < 0) {
-            if (errno == EINTR) {
-                continue;   // 被信号中断，重新轮询
-            }
-            std::cerr << "poll error: " << strerror(errno) << std::endl;
-            break;
-        }
-        if (poll_ret == 0) {
-            renderer.PollEvents();
-            continue;   // 超时，重新轮询
-        }
-        if (pfd.revents & (POLLERR | POLLHUP)) {
-            std::cerr << "device error: " << strerror(errno) << std::endl;
-            break;
-        }
-        if (!(pfd.revents & POLLIN)) {
-            renderer.PollEvents();
-            continue;   // 无数据可读，重新轮询
-        }
-
-        // DQBUF —— 取出填好的一帧
-        v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EAGAIN) {
-                renderer.PollEvents();
-                continue;
-            }
-            if (errno == EINTR) {
-                continue;   // 被信号中断，重新轮询
-            }
-            std::cerr << "DQBUF error: " << strerror(errno) << std::endl;
-            break;
-        }
-
-        // 构造 MediaFrame（YUYV 原始数据）
-        size_t used = buf.bytesused ? buf.bytesused : fmt.fmt.pix.sizeimage;
-        auto yuyv_frame = MediaFrame::CreateCompact(
-            static_cast<const unsigned char*>(buffers[buf.index].start), used, PixelFormat::kYUYV422, width, height, stride);
-
-        // 检查并填入时间戳：V4L2 timeval -> 微秒
-        if (frame_count == 0) {
-            if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
-                std::cout << "timestamp clock: CLOCK_MONOTONIC" << std::endl;
-            } else if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY) {
-                std::cout << "timestamp clock: hardware copy (raw sensor timestamp)" << std::endl;
-            } else {
-                std::cout << "timestamp clock: CLOCK_REALTIME (may drift with NTP)" << std::endl;
-            }
-        }
-        yuyv_frame->time.pts_us = static_cast<int64_t>(buf.timestamp.tv_sec) * 1'000'000LL
-                                + buf.timestamp.tv_usec;
-
-        // YUYV -> I420
-        std::shared_ptr<MediaFrame> i420_frame;
-        if (!converter.Convert(*yuyv_frame, i420_frame)) {
-            std::cerr << "conversion failed at frame " << frame_count << std::endl;
-            break;
-        }
-
-        // OpenGL 渲染
-        if (!renderer.Render(*i420_frame)) {
-            std::cerr << "render failed: " << renderer.LastError() << std::endl;
-            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-            break;
-        }
-
-        ++frame_count;
-        // if (frame_count % 30 == 0)
-        //     std::cout << "frame " << frame_count << std::endl;
-
-        // QBUF —— 归还缓冲区
-        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-
-        renderer.PollEvents();
-    }
-
-    // ================================================================
-    // 10. 清理
-    // ================================================================
-    std::cout << "stopping... rendered " << frame_count << " frames" << std::endl;
-
-    xioctl(fd, VIDIOC_STREAMOFF, &type, "VIDIOC_STREAMOFF");
-    close(fd);
+void PrintCapability(const v4l2_capability& cap) {
+    std::cout << "driver:  " << cap.driver  << '\n';
+    std::cout << "card:    " << cap.card    << '\n';
+    std::cout << "bus:     " << cap.bus_info << '\n';
+    std::cout << "capture: " << ((cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ? "YES" : "NO") << '\n';
+    std::cout << "stream:  " << ((cap.capabilities & V4L2_CAP_STREAMING)     ? "YES" : "NO") << '\n';
 }
 
-int v4l2_multiplane_demo(int argc, char* argv[]) {
-    const char* device = (argc > 1) ? argv[1] : "/dev/video1";
-
-    // ================================================================
-    //  1. OPEN
-    // ================================================================
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        std::cerr << "open " << device << " failed: " << strerror(errno) << std::endl;
-        return 1;
-    }
-
-    // ================================================================
-    //  2. QUERYCAP
-    // ================================================================
-    v4l2_capability cap{};
-    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
-
-    std::cout << "driver:  " << cap.driver  << std::endl;
-    std::cout << "card:    " << cap.card    << std::endl;
-    std::cout << "bus:     " << cap.bus_info << std::endl;
-    std::cout << "capture: " << ((cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)  ? "YES" : "NO") << std::endl;
-    std::cout << "stream:  " << ((cap.capabilities & V4L2_CAP_STREAMING)      ? "YES" : "NO") << std::endl;
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
-        std::cerr << "device does not support multiplane capture" << std::endl;
-        close(fd);
-        return 1;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        std::cerr << "device does not support streaming" << std::endl;
-        close(fd);
-        return 1;
-    }
-
-    // ================================================================
-    //  3. S_FMT（多平面）
-    // ================================================================
-    v4l2_format fmt{};
-    fmt.type                     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    fmt.fmt.pix_mp.width         = 640;
-    fmt.fmt.pix_mp.height        = 480;
-    fmt.fmt.pix_mp.pixelformat   = V4L2_PIX_FMT_YUV420M;
-    fmt.fmt.pix_mp.field         = V4L2_FIELD_NONE;
-    std::cout << "setting format: " << (int)fmt.fmt.pix_mp.pixelformat << std::endl;
-    xioctl(fd, VIDIOC_S_FMT, &fmt, "VIDIOC_S_FMT");
-
-    // 回读校验
-    if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420M) {
-        std::cout << "driver returned different pixfmt: " << (int)fmt.fmt.pix_mp.pixelformat << std::endl;
-        return 1;
-    }
-    if (fmt.fmt.pix_mp.width != 640 || fmt.fmt.pix_mp.height != 480) {
-        std::cout << "driver adjusted size to " << fmt.fmt.pix_mp.width << "x" << fmt.fmt.pix_mp.height << std::endl;
-    }
-
-    int width      = fmt.fmt.pix_mp.width;
-    int height     = fmt.fmt.pix_mp.height;
-    int num_planes = fmt.fmt.pix_mp.num_planes;   //  多平面核心：驱动返回实际平面数
-    int stride     = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-
-    std::cout << "format:  " << width << "x" << height
-              << "  planes=" << num_planes
-              << "  stride=" << stride
-              << "  size[0]=" << fmt.fmt.pix_mp.plane_fmt[0].sizeimage << std::endl;
-
-    for (int p = 0; p < num_planes; ++p) {
-    std::cout << "  plane[" << p << "]"
-              << " bytesperline=" << fmt.fmt.pix_mp.plane_fmt[p].bytesperline
-              << " sizeimage="    << fmt.fmt.pix_mp.plane_fmt[p].sizeimage
-              << std::endl;
-    
-    const auto& pf = fmt.fmt.pix_mp.plane_fmt;
-    std::cout << "Y:  bpl=" << pf[0].bytesperline
-            << " size=" << pf[0].sizeimage
-            << " bpl*h=" << (pf[0].bytesperline * height)
-            << std::endl;
-    std::cout << "U:  bpl=" << pf[1].bytesperline
-            << " size=" << pf[1].sizeimage
-            << " bpl*(h/2)=" << (pf[1].bytesperline * (height/2))
-            << " Y/2=" << (pf[0].bytesperline / 2)
-            << std::endl;
-    std::cout << "V:  bpl=" << pf[2].bytesperline
-            << " size=" << pf[2].sizeimage
-            << " bpl*(h/2)=" << (pf[2].bytesperline * (height/2))
-            << std::endl;
+uint32_t DeviceCaps(const v4l2_capability& cap) {
+    return (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
 }
-    // ================================================================
-    //  4. REQBUFS
-    // ================================================================
-    v4l2_requestbuffers req{};
-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    req.memory = V4L2_MEMORY_MMAP;
-    req.count  = REQ_BUF_COUNT;
-    xioctl(fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS");
-    std::cout << "buffers: " << req.count << std::endl;
 
-    // ================================================================
-    //  5. QUERYBUF + mmap（每个平面独立映射）
-    // ================================================================
-    std::vector<MultiPlaneVideoBuffer> buffers(req.count);
-    for (unsigned i = 0; i < req.count; ++i) {
+// 申请缓冲区（单平面 / 多平面通用）
+unsigned RequestBuffers(int fd, v4l2_buf_type type, unsigned count) {
+    v4l2_requestbuffers req{};
+    req.type   = type;
+    req.memory = V4L2_MEMORY_MMAP;
+    req.count  = count;
+    xioctl(fd, VIDIOC_REQBUFS, &req, "VIDIOC_REQBUFS");
+    std::cout << "buffers: " << req.count << '\n';
+    return req.count;
+}
+
+// 多平面 QBUF 入队
+void QueueMultiPlaneBuffers(int fd, unsigned count, int num_planes) {
+    for (unsigned i = 0; i < count; ++i) {
         v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
         v4l2_buffer buf{};
         buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory   = V4L2_MEMORY_MMAP;
         buf.index    = i;
-        buf.length   = static_cast<__u32>(num_planes);  // 平面数量
-        buf.m.planes = mplanes;                          // 指向平面数组
-        xioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");        
+        buf.length   = static_cast<__u32>(num_planes);
+        buf.m.planes = mplanes;
+        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
+    }
+}
+
+// STREAMON
+void StartStreaming(int fd, v4l2_buf_type type) {
+    xioctl(fd, VIDIOC_STREAMON, &type, "VIDIOC_STREAMON");
+    std::cout << "stream ON\n";
+}
+
+// STREAMOFF + close
+void StopStreamingAndClose(int fd, v4l2_buf_type type) {
+    xioctl(fd, VIDIOC_STREAMOFF, &type, "VIDIOC_STREAMOFF");
+    close(fd);
+}
+
+// 时间戳时钟类型（仅首帧打印）
+void PrintTimestampClock(const v4l2_buffer& buf, int frame_count) {
+    if (frame_count != 0) return;
+    if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
+        std::cout << "timestamp clock: CLOCK_MONOTONIC\n";
+    else if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY)
+        std::cout << "timestamp clock: hardware copy (raw sensor timestamp)\n";
+    else
+        std::cout << "timestamp clock: CLOCK_REALTIME (may drift with NTP)\n";
+}
+
+// V4L2 timeval → 微秒
+int64_t TimevalToUs(const timeval& tv) {
+    return static_cast<int64_t>(tv.tv_sec) * 1'000'000LL + tv.tv_usec;
+}
+
+// 渲染器初始化（失败时自动 STREAMOFF + close）
+bool InitRenderer(render::OpenGLVideoRenderer& renderer, int width, int height,
+                  const char* title, int fd, v4l2_buf_type type) {
+    render::RenderConfig cfg;
+    cfg.window_width  = width;
+    cfg.window_height = height;
+    cfg.title         = title;
+    cfg.vsync         = false;
+    if (!renderer.Init(cfg)) {
+        std::cerr << "renderer init failed: " << renderer.LastError() << '\n';
+        StopStreamingAndClose(fd, type);
+        return false;
+    }
+    return true;
+}
+
+// ---- 多平面格式设置 ----
+
+struct MultiPlaneFormatInfo {
+    int width = 0, height = 0, num_planes = 0, stride = 0;
+    v4l2_format fmt = {};
+};
+
+MultiPlaneFormatInfo SetupMultiPlaneFormat(int fd, int req_w = 640, int req_h = 480) {
+    MultiPlaneFormatInfo info;
+    info.fmt.type                   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    info.fmt.fmt.pix_mp.width       = req_w;
+    info.fmt.fmt.pix_mp.height      = req_h;
+    info.fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420M;
+    info.fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
+
+    xioctl(fd, VIDIOC_S_FMT, &info.fmt, "VIDIOC_S_FMT");
+
+    if (info.fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420M)
+        std::cout << "driver returned different pixfmt: " << (int)info.fmt.fmt.pix_mp.pixelformat << '\n';
+    if (info.fmt.fmt.pix_mp.width != req_w || info.fmt.fmt.pix_mp.height != req_h)
+        std::cout << "driver adjusted size to " << info.fmt.fmt.pix_mp.width << 'x' << info.fmt.fmt.pix_mp.height << '\n';
+
+    info.width      = info.fmt.fmt.pix_mp.width;
+    info.height     = info.fmt.fmt.pix_mp.height;
+    info.num_planes = info.fmt.fmt.pix_mp.num_planes;
+    info.stride     = info.fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+
+    std::cout << "format:  " << info.width << 'x' << info.height
+              << "  planes=" << info.num_planes
+              << "  stride=" << info.stride
+              << "  size[0]=" << info.fmt.fmt.pix_mp.plane_fmt[0].sizeimage << '\n';
+
+    for (int p = 0; p < info.num_planes; ++p) {
+        std::cout << "  plane[" << p << "]"
+                  << " bytesperline=" << info.fmt.fmt.pix_mp.plane_fmt[p].bytesperline
+                  << " sizeimage="    << info.fmt.fmt.pix_mp.plane_fmt[p].sizeimage << '\n';
+    }
+    return info;
+}
+
+// ---- 轮询 / DQBUF 辅助 ----
+
+enum class PollStatus { Ready, Timeout, Error, DeviceError };
+
+PollStatus PollDevice(int fd, int timeout_ms) {
+    pollfd pfd{fd, POLLIN, 0};
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0)  return (errno == EINTR) ? PollStatus::Timeout : PollStatus::Error;
+    if (ret == 0) return PollStatus::Timeout;
+    if (pfd.revents & (POLLERR | POLLHUP)) return PollStatus::DeviceError;
+    if (!(pfd.revents & POLLIN))           return PollStatus::Timeout;
+    return PollStatus::Ready;
+}
+
+// DQBUF（多平面），返回 false 表示应退出循环
+bool DequeueMultiPlaneBuffer(int fd, v4l2_buffer& buf, v4l2_plane* planes,
+                             int num_planes, render::OpenGLVideoRenderer& renderer,
+                             bool& failed) {
+    buf = {};
+    buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.memory   = V4L2_MEMORY_MMAP;
+    buf.length   = static_cast<__u32>(num_planes);
+    buf.m.planes = planes;
+    if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN || errno == EINTR) { renderer.PollEvents(); return true; }
+        failed = true;
+        std::cerr << "DQBUF error: " << strerror(errno) << '\n';
+        return false;
+    }
+    if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
+        return true;  // 丢弃错误帧，继续
+    }
+    return true;
+}
+
+} // namespace
+
+// ================================================================
+//  Demo 1: 单平面 YUYV 采集 → I420 转换 → OpenGL 渲染
+// ================================================================
+int v4l2_demo(int argc, char* argv[]) {
+    const char* device = (argc > 1) ? argv[1] : "/dev/video0";
+
+    int fd = open(device, O_RDWR);
+    if (fd < 0) { std::cerr << "open " << device << " failed: " << strerror(errno) << '\n'; return 1; }
+
+    v4l2_capability cap{};
+    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
+    PrintCapability(cap);
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) || !(cap.capabilities & V4L2_CAP_STREAMING)) {
+        std::cerr << "device does not support capture/streaming\n"; close(fd); return 1;
+    }
+
+    v4l2_format fmt{};
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = 1920;
+    fmt.fmt.pix.height      = 1080;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    xioctl(fd, VIDIOC_S_FMT, &fmt, "VIDIOC_S_FMT");
+
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV)
+        std::cout << "driver returned different pixfmt: " << (int)fmt.fmt.pix.pixelformat << '\n';
+
+    int width  = fmt.fmt.pix.width;
+    int height = fmt.fmt.pix.height;
+    int stride = fmt.fmt.pix.bytesperline;
+    std::cout << "format:  " << width << 'x' << height
+              << "  stride=" << stride << "  size=" << fmt.fmt.pix.sizeimage << '\n';
+
+    unsigned buf_count = RequestBuffers(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE, REQ_BUF_COUNT);
+
+    std::vector<VideoBuffer> buffers(buf_count);
+    for (unsigned i = 0; i < buf_count; ++i) {
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP; buf.index = i;
+        xioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED)
+            throw std::runtime_error(std::string("mmap: ") + strerror(errno));
+        std::cout << "buf[" << i << "] addr=" << buffers[i].start << " len=" << buffers[i].length << '\n';
+    }
+
+    for (unsigned i = 0; i < buf_count; ++i) {
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP; buf.index = i;
+        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
+    }
+
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    StartStreaming(fd, type);
+
+    render::OpenGLVideoRenderer renderer;
+    if (!InitRenderer(renderer, width, height, "V4L2 Raw + OpenGL Demo", fd, type)) return 1;
+
+    MediaFrameConverter converter;
+    {
+        MediaFrameConverterConfig conv_cfg;
+        conv_cfg.video = {static_cast<int32_t>(width), static_cast<int32_t>(height), PixelFormat::kI420, 2};
+        if (!converter.Open(conv_cfg)) throw std::runtime_error("converter open failed");
+    }
+
+    int frame_count = 0;
+    std::cout << "capturing... (press ESC to quit)\n";
+
+    while (!renderer.ShouldClose()) {
+        PollStatus ps = PollDevice(fd, 100);
+        if (ps == PollStatus::Error)         { std::cerr << "poll error\n"; break; }
+        if (ps == PollStatus::DeviceError)   { std::cerr << "device error\n"; break; }
+        if (ps != PollStatus::Ready)         { renderer.PollEvents(); continue; }
+
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN || errno == EINTR) { renderer.PollEvents(); continue; }
+            std::cerr << "DQBUF error: " << strerror(errno) << '\n'; break;
+        }
+
+        size_t used = buf.bytesused ? buf.bytesused : fmt.fmt.pix.sizeimage;
+        auto yuyv_frame = MediaFrame::CreateCompact(
+            static_cast<const unsigned char*>(buffers[buf.index].start), used,
+            PixelFormat::kYUYV422, width, height, stride);
+
+        PrintTimestampClock(buf, frame_count);
+        yuyv_frame->time.pts_us = TimevalToUs(buf.timestamp);
+
+        std::shared_ptr<MediaFrame> i420_frame;
+        if (!converter.Convert(*yuyv_frame, i420_frame)) {
+            std::cerr << "conversion failed at frame " << frame_count << '\n'; break;
+        }
+        if (!renderer.Render(*i420_frame)) {
+            std::cerr << "render failed: " << renderer.LastError() << '\n';
+            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF"); break;
+        }
+        ++frame_count;
+        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
+        renderer.PollEvents();
+    }
+
+    std::cout << "stopping... rendered " << frame_count << " frames\n";
+    StopStreamingAndClose(fd, type);
+    return 0;
+}
+
+// ================================================================
+//  Demo 2: 多平面 YUV420M (mmap) → I420 → OpenGL 渲染
+// ================================================================
+int v4l2_multiplane_demo(int argc, char* argv[]) {
+    const char* device = (argc > 1) ? argv[1] : "/dev/video1";
+
+    int fd = open(device, O_RDWR);
+    if (fd < 0) { std::cerr << "open " << device << " failed: " << strerror(errno) << '\n'; return 1; }
+
+    v4l2_capability cap{};
+    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
+    PrintCapability(cap);
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) || !(cap.capabilities & V4L2_CAP_STREAMING)) {
+        std::cerr << "device does not support multiplanar capture/streaming\n"; close(fd); return 1;
+    }
+
+    auto [width, height, num_planes, stride, fmt] = SetupMultiPlaneFormat(fd);  (void)fmt;
+
+    unsigned buf_count = RequestBuffers(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, REQ_BUF_COUNT);
+
+    std::vector<MultiPlaneVideoBuffer> buffers(buf_count);
+    for (unsigned i = 0; i < buf_count; ++i) {
+        v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i; buf.length = static_cast<__u32>(num_planes); buf.m.planes = mplanes;
+        xioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");
 
         buffers[i].planes.resize(num_planes);
         std::cout << "buf[" << i << "]";
         for (int p = 0; p < num_planes; ++p) {
             buffers[i].planes[p].length = mplanes[p].length;
-            buffers[i].planes[p].start = mmap(nullptr, mplanes[p].length,
-                                       PROT_READ | PROT_WRITE, MAP_SHARED,
-                                       fd, mplanes[p].m.mem_offset);
-            if (buffers[i].planes[p].start == MAP_FAILED) {
+            buffers[i].planes[p].start = mmap(nullptr, mplanes[p].length, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED, fd, mplanes[p].m.mem_offset);
+            if (buffers[i].planes[p].start == MAP_FAILED)
                 throw std::runtime_error(std::string("mmap plane ") + std::to_string(p) + ": " + strerror(errno));
-            }
             std::cout << " plane[" << p << "]=" << buffers[i].planes[p].start
                       << " len=" << buffers[i].planes[p].length;
         }
-        std::cout << std::endl;
+        std::cout << '\n';
     }
 
-    // ================================================================
-    //  6. QBUF（入队，让内核填充数据）
-    // ================================================================
-    for (unsigned i = 0; i < req.count; ++i) {
-        v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
-        v4l2_buffer buf{};
-        buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.index    = i;
-        buf.length   = static_cast<__u32>(num_planes);
-        buf.m.planes = mplanes;
-        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-        if (buf.length != static_cast<__u32>(num_planes)) {
-            std::cerr << "unexpected plane count: " << buf.length << std::endl;
-            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-            continue;
-        }
-        
-    }
-
-    // ================================================================
-    //  7. STREAMON
-    // ================================================================
+    QueueMultiPlaneBuffers(fd, buf_count, num_planes);
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    xioctl(fd, VIDIOC_STREAMON, &type, "VIDIOC_STREAMON");
-    std::cout << "stream ON" << std::endl;
-
-    // ================================================================
-    //  8. OpenGL 渲染器初始化
-    // ================================================================
-    render::RenderConfig render_config;
-    render_config.window_width  = width;
-    render_config.window_height = height;
-    render_config.title         = "V4L2 MultiPlane + OpenGL Demo";
-    render_config.vsync         = false;
+    StartStreaming(fd, type);
 
     render::OpenGLVideoRenderer renderer;
-    if (!renderer.Init(render_config)) {
-        std::cerr << "renderer init failed: " << renderer.LastError() << std::endl;
-        xioctl(fd, VIDIOC_STREAMOFF, &type, "VIDIOC_STREAMOFF");
-        close(fd);
-        return 1;
-    }
+    if (!InitRenderer(renderer, width, height, "V4L2 MultiPlane + OpenGL Demo", fd, type)) return 1;
 
-    // YUV420M 数据已经是 I420 格式，OpenGL 渲染器原生支持，无需转换
-    // ================================================================
-    //  8. OpenGL 渲染器初始化
-    // ================================================================
     int frame_count = 0;
-    std::cout << "capturing... (press ESC to quit)" << std::endl;
-    pollfd pfd{};
-    pfd.fd     = fd;
-    pfd.events = POLLIN;
-
-    // 用于拼合多平面数据的临时缓冲区
     std::vector<uint8_t> contiguous_buf;
+    std::cout << "capturing... (press ESC to quit)\n";
 
     while (!renderer.ShouldClose()) {
-        int poll_ret = poll(&pfd, 1, 100);
-        if (poll_ret < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            std::cerr << "poll error: " << strerror(errno) << std::endl;
-            break;
-        }
-        if (poll_ret == 0) {
-            renderer.PollEvents();
-            continue;
-        }
-        if (pfd.revents & (POLLERR | POLLHUP)) {
-            std::cerr << "device error: " << strerror(errno) << std::endl;
-            break;
-        }
-        if (!(pfd.revents & POLLIN)) {
-            renderer.PollEvents();
-            continue;
-        }
+        PollStatus ps = PollDevice(fd, 100);
+        if (ps == PollStatus::Error)         { std::cerr << "poll error\n"; break; }
+        if (ps == PollStatus::DeviceError)   { std::cerr << "device error\n"; break; }
+        if (ps != PollStatus::Ready)         { renderer.PollEvents(); continue; }
 
-        // DQBUF —— 取出填好的一帧（多平面）
         v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
         v4l2_buffer buf{};
-        buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.length   = static_cast<__u32>(num_planes);
-        buf.m.planes = mplanes;
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; buf.memory = V4L2_MEMORY_MMAP;
+        buf.length = static_cast<__u32>(num_planes); buf.m.planes = mplanes;
         if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EAGAIN) {
-                renderer.PollEvents();
-                continue;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            std::cerr << "DQBUF error: " << strerror(errno) << std::endl;
-            break;
+            if (errno == EAGAIN || errno == EINTR) { renderer.PollEvents(); continue; }
+            std::cerr << "DQBUF error: " << strerror(errno) << '\n'; break;
         }
-
         if (buf.flags & V4L2_BUF_FLAG_ERROR) {
-            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");  // 直接归还，丢弃这帧
-            continue;
+            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF"); continue;
         }
 
-        // 拼合多平面数据到连续缓冲区
-        // 注意：用 plane_fmt[].sizeimage 而非 bytesused，
-        // 保证每个平面的 stride padding 不被截断，
-        // 这样 CreateCompact 内部的 SourcePlaneLayout::Compute
-        // 按 stride*rows 计算的各平面偏移才能对齐
         size_t total_used = 0;
-        for (int p = 0; p < num_planes; ++p) {
+        for (int p = 0; p < num_planes; ++p)
             total_used += fmt.fmt.pix_mp.plane_fmt[p].sizeimage;
-        }
         contiguous_buf.resize(total_used);
         size_t offset = 0;
         for (int p = 0; p < num_planes; ++p) {
             size_t plane_bytes = fmt.fmt.pix_mp.plane_fmt[p].sizeimage;
             const uint8_t* src = static_cast<const uint8_t*>(buffers[buf.index].planes[p].start)
-                   + mplanes[p].data_offset; // data_offset 不一定为 0
-            memcpy(contiguous_buf.data() + offset, src, plane_bytes);            
+                                 + mplanes[p].data_offset;
+            memcpy(contiguous_buf.data() + offset, src, plane_bytes);
             offset += plane_bytes;
         }
 
-        // 构造 MediaFrame（YUV420M -> I420，格式天然兼容）
         auto i420_frame = MediaFrame::CreateCompact(
-            contiguous_buf.data(), total_used,
-            PixelFormat::kI420, width, height, stride);
+            contiguous_buf.data(), total_used, PixelFormat::kI420, width, height, stride);
 
-        // 检查并填入时间戳：V4L2 timeval -> 微秒
-        if (frame_count == 0) {
-            if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
-                std::cout << "timestamp clock: CLOCK_MONOTONIC" << std::endl;
-            } else if (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY) {
-                std::cout << "timestamp clock: hardware copy (raw sensor timestamp)" << std::endl;
-            } else {
-                std::cout << "timestamp clock: CLOCK_REALTIME (may drift with NTP)" << std::endl;
-            }
-        }
-        i420_frame->time.pts_us = static_cast<int64_t>(buf.timestamp.tv_sec) * 1'000'000LL
-                                + buf.timestamp.tv_usec;
+        PrintTimestampClock(buf, frame_count);
+        i420_frame->time.pts_us = TimevalToUs(buf.timestamp);
 
-        // OpenGL 渲染（YUV420M 即 I420，渲染器原生支持，零转换）
         if (!renderer.Render(*i420_frame)) {
-            std::cerr << "render failed: " << renderer.LastError() << std::endl;
-            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-            break;
+            std::cerr << "render failed: " << renderer.LastError() << '\n';
+            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF"); break;
         }
-
         ++frame_count;
-
-        // QBUF —— 归还缓冲区
         xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-
         renderer.PollEvents();
     }
 
-    // ================================================================
-    // 10. 清理
-    // ================================================================
-    std::cout << "stopping... rendered " << frame_count << " frames" << std::endl;
+    std::cout << "stopping... rendered " << frame_count << " frames\n";
+    StopStreamingAndClose(fd, type);
+    return 0;
+}
 
-    xioctl(fd, VIDIOC_STREAMOFF, &type, "VIDIOC_STREAMOFF");
-    close(fd);
+// ================================================================
+//  Demo 3: 多平面 YUV420M (DMA-BUF 零拷贝) → OpenGL 渲染
+// ================================================================
+int v4l2_multiplane_dma_demo(int argc, char* argv[]) {
+    const char* device = (argc > 1) ? argv[1] : "/dev/video1";
+    const int max_frames = argc > 2 ? std::stoi(argv[2]) : -1;
+    const bool strict_import = argc > 3 && std::string(argv[3]) == "--require-import";
+    bool failed = false;
+
+    int fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) { std::cerr << "open " << device << " failed: " << strerror(errno) << '\n'; return 1; }
+
+    v4l2_capability cap{};
+    xioctl(fd, VIDIOC_QUERYCAP, &cap, "VIDIOC_QUERYCAP");
+    PrintCapability(cap);
+    auto caps = DeviceCaps(cap);
+    if (!(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) || !(caps & V4L2_CAP_STREAMING)) {
+        std::cerr << "device does not support multiplanar capture/streaming\n"; close(fd); return 1;
+    }
+
+    auto [width, height, num_planes, stride, fmt] = SetupMultiPlaneFormat(fd);  (void)stride;
+    if (num_planes != 3) { std::cerr << "YUV420M requires 3 planes\n"; close(fd); return 1; }
+
+    {
+        const auto& pf = fmt.fmt.pix_mp.plane_fmt;
+        std::cout << "Y: bpl=" << pf[0].bytesperline << " size=" << pf[0].sizeimage
+                  << " bpl*h=" << (pf[0].bytesperline * height) << '\n';
+        std::cout << "U: bpl=" << pf[1].bytesperline << " size=" << pf[1].sizeimage
+                  << " bpl*(h/2)=" << (pf[1].bytesperline * (height / 2))
+                  << " Y/2=" << (pf[0].bytesperline / 2) << '\n';
+        std::cout << "V: bpl=" << pf[2].bytesperline << " size=" << pf[2].sizeimage
+                  << " bpl*(h/2)=" << (pf[2].bytesperline * (height / 2)) << '\n';
+        assert(pf[0].bytesperline == (unsigned)width);
+        assert(pf[1].bytesperline == pf[0].bytesperline / 2);
+        assert(pf[2].bytesperline == pf[0].bytesperline / 2);
+        assert(pf[0].sizeimage == pf[0].bytesperline * height);
+        assert(pf[1].sizeimage == pf[1].bytesperline * (height / 2));
+        assert(pf[2].sizeimage == pf[2].bytesperline * (height / 2));
+    }
+
+    unsigned buf_count = RequestBuffers(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, REQ_BUF_COUNT);
+
+    std::vector<MultiPlaneVideoBuffer> buffers(buf_count);
+    std::vector<ExportedBuffer> exported_buffers(buf_count);
+    for (unsigned i = 0; i < buf_count; ++i) {
+        v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i; buf.length = static_cast<__u32>(num_planes); buf.m.planes = mplanes;
+        xioctl(fd, VIDIOC_QUERYBUF, &buf, "VIDIOC_QUERYBUF");
+
+        for (int k = 0; k < num_planes; ++k) {
+            v4l2_exportbuffer expbuf{};
+            expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; expbuf.index = i;
+            expbuf.plane = k; expbuf.flags = O_CLOEXEC | O_RDWR;
+            if (ioctl(fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+                std::cerr << "EXPBUF buf[" << i << "] plane[" << k << "]: " << strerror(errno) << '\n';
+                close(fd); return 1;
+            }
+            exported_buffers[i].dma_fds[k] = expbuf.fd;
+        }
+        exported_buffers[i].num_planes = num_planes;
+
+        buffers[i].planes.resize(num_planes);
+        std::cout << "buf[" << i << "]";
+        for (int p = 0; p < num_planes; ++p) {
+            buffers[i].planes[p].length = mplanes[p].length;
+            std::cout << " plane[" << p << "] fd=" << exported_buffers[i].dma_fds[p]
+                      << " len=" << buffers[i].planes[p].length;
+        }
+        std::cout << '\n';
+    }
+
+    QueueMultiPlaneBuffers(fd, buf_count, num_planes);
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    StartStreaming(fd, type);
+
+    render::OpenGLVideoRenderer renderer;
+    if (!InitRenderer(renderer, width, height, "V4L2 MultiPlane DMA-BUF + OpenGL Demo", fd, type)) return 1;
+
+    int frame_count = 0;
+    std::cout << "capturing... (press ESC to quit)\n";
+
+    while (!renderer.ShouldClose() && (max_frames <= 0 || frame_count < max_frames)) {
+        PollStatus ps = PollDevice(fd, 100);
+        if (ps == PollStatus::Error)         { failed = true; std::cerr << "poll error\n"; break; }
+        if (ps == PollStatus::DeviceError)   { failed = true; std::cerr << "device error\n"; break; }
+        if (ps != PollStatus::Ready)         { renderer.PollEvents(); continue; }
+
+        v4l2_plane mplanes[VIDEO_MAX_PLANES]{};
+        v4l2_buffer buf{};
+        if (!DequeueMultiPlaneBuffer(fd, buf, mplanes, num_planes, renderer, failed)) break;
+
+        if (buf.index >= buffers.size() || buf.length != static_cast<unsigned>(num_planes)) {
+            std::cerr << "invalid dequeued buffer index or plane count\n"; failed = true; break;
+        }
+
+        render::DmaBufVideoFrame dma_frame;
+        dma_frame.width = width; dma_frame.height = height; dma_frame.format = PixelFormat::kI420;
+        for (int p = 0; p < num_planes; ++p) {
+            const auto pitch = fmt.fmt.pix_mp.plane_fmt[p].bytesperline;
+            const auto rows = p == 0 ? height : (height + 1) / 2;
+            const auto row_bytes = p == 0 ? width : (width + 1) / 2;
+            const auto used = static_cast<std::uint64_t>(pitch) * (rows - 1) + row_bytes;
+            const uint32_t bytesused = mplanes[p].bytesused
+                                       ? mplanes[p].bytesused
+                                       : fmt.fmt.pix_mp.plane_fmt[p].sizeimage;
+            if (mplanes[p].data_offset > bytesused ||
+                bytesused > buffers[buf.index].planes[p].length ||
+                used > bytesused - mplanes[p].data_offset ||
+                mplanes[p].data_offset > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+                failed = true; break;
+            }
+            dma_frame.planes.push_back({exported_buffers[buf.index].dma_fds[p],
+                static_cast<int>(mplanes[p].data_offset), static_cast<int>(pitch),
+                buffers[buf.index].planes[p].length});
+        }
+        if (failed) { std::cerr << "invalid plane payload\n"; break; }
+
+        PrintTimestampClock(buf, frame_count);
+
+        if (!renderer.RenderDmaBuf(dma_frame, !strict_import)) {
+            failed = true;
+            std::cerr << "render failed: " << renderer.LastError() << '\n';
+            xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF"); break;
+        }
+
+        ++frame_count;
+        if (frame_count == 1) {
+            std::cout << "DMA-BUF render path: "
+                      << (renderer.LastDmaBufWasImported() ? "EGLImage import" : "CPU mmap + plane texture upload")
+                      << '\n' << renderer.DmaBufImportError() << '\n';
+        }
+
+        xioctl(fd, VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
+        renderer.PollEvents();
+    }
+
+    std::cout << "stopping... rendered " << frame_count << " frames\n";
+    StopStreamingAndClose(fd, type);
+    renderer.Shutdown();
+    return failed ? 1 : 0;
 }
 
 int main(int argc, char* argv[]) {
     // return v4l2_demo(argc, argv);
-    return v4l2_multiplane_demo(argc, argv);
-
+    try {
+        return v4l2_multiplane_dma_demo(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }
