@@ -1,10 +1,11 @@
 #include "media/capture/v4l2_video_capture.h"
+#include "media/capture/capture_queue.h"
 
 #include <cerrno>
 #include <climits>
 #include <cstring>
-#include <functional>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 #include <fcntl.h>
@@ -12,7 +13,6 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 namespace {
@@ -68,52 +68,6 @@ CaptureReadResult ReadFailure(CaptureError error) {
 }
 }
 
-struct V4L2VideoCapture::BufferPool {
-    struct Mapping { void* address; std::size_t length; };
-    int fd{-1};
-    bool active{false};
-    std::mutex mutex;
-    std::vector<Mapping> mappings;
-
-    ~BufferPool() {
-        for (const auto& mapping : mappings) ::munmap(mapping.address, mapping.length);
-        if (fd >= 0) ::close(fd);
-    }
-
-    void Return(v4l2_buffer buffer) noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (active && Ioctl(fd, VIDIOC_QBUF, &buffer) < 0) {
-            LOG_ERROR("Deferred capture QBUF failed: {}", std::strerror(errno));
-        }
-    }
-
-    void Stop() noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (active) {
-            auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            Ioctl(fd, VIDIOC_STREAMOFF, &type);
-            active = false;
-        }
-        // Detach buffers from the queue; supported drivers orphan retained mappings.
-        if (fd >= 0) {
-            v4l2_requestbuffers request{};
-            request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            request.memory = V4L2_MEMORY_MMAP;
-            if (Ioctl(fd, VIDIOC_REQBUFS, &request) < 0 && errno != EINVAL) {
-                LOG_WARN("Cannot release capture queue with retained mappings: {}", std::strerror(errno));
-            }
-        }
-        // Retained frames keep mappings alive, but cannot requeue after shutdown.
-        if (fd >= 0) ::close(fd);
-        fd = -1;
-    }
-};
-
-struct DeferredBufferReturn {
-    std::function<void()> return_buffer;
-    ~DeferredBufferReturn() { if (return_buffer) return_buffer(); }
-};
-
 V4L2VideoCapture::V4L2VideoCapture(V4L2CaptureConfig config) : config_(std::move(config)) {}
 V4L2VideoCapture::~V4L2VideoCapture() { Close(); }
 
@@ -131,18 +85,21 @@ CaptureOpenResult V4L2VideoCapture::Open() {
         (config_.pixel_format != PixelFormat::kYUYV422 && config_.height % 2 != 0) ||
         Fourcc(config_.pixel_format) == 0 || config_.frame_rate.num <= 0 ||
         config_.frame_rate.den <= 0 || config_.buffer_count < 2 || config_.buffer_count > 64 ||
-        config_.poll_timeout.count() <= 0 || config_.poll_timeout.count() > INT_MAX) {
+        config_.poll_timeout.count() <= 0 || config_.poll_timeout.count() > INT_MAX ||
+        (config_.delivery_mode != V4L2DeliveryMode::Copy && config_.delivery_mode != V4L2DeliveryMode::MmapLease)) {
         return failed({CaptureErrorCategory::InvalidConfiguration, 0, "Invalid V4L2 capture configuration", false});
     }
     {
         std::lock_guard<std::mutex> wake_lock(wake_mutex_);
         wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     }
-    if (wake_fd_ < 0) return failed(NativeError("eventfd", errno));
-    pool_ = std::make_shared<BufferPool>();
+    if (wake_fd_ < 0) {
+        return failed(NativeError("eventfd", errno));
+    }
     device_fd_ = ::open(config_.device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    pool_->fd = device_fd_;
-    if (device_fd_ < 0) return failed(NativeError("open capture device", errno));
+    if (device_fd_ < 0) {
+        return failed(NativeError("open capture device", errno));
+    }
 
     // 查询设备能力，确保是单平面视频采集设备
     v4l2_capability caps{};
@@ -162,8 +119,12 @@ CaptureOpenResult V4L2VideoCapture::Open() {
     format.fmt.pix.height = static_cast<unsigned int>(config_.height);
     format.fmt.pix.pixelformat = Fourcc(config_.pixel_format);
     format.fmt.pix.field = V4L2_FIELD_NONE;
-    if (Ioctl(device_fd_, VIDIOC_S_FMT, &format) < 0) return failed(NativeError("S_FMT", errno));
-    if (Ioctl(device_fd_, VIDIOC_G_FMT, &format) < 0) return failed(NativeError("G_FMT", errno));
+    if (Ioctl(device_fd_, VIDIOC_S_FMT, &format) < 0) {
+        return failed(NativeError("S_FMT", errno));
+    }
+    if (Ioctl(device_fd_, VIDIOC_G_FMT, &format) < 0) {
+        return failed(NativeError("G_FMT", errno));
+    }
     const auto& pix = format.fmt.pix;
     if (pix.field != V4L2_FIELD_NONE || Pixel(pix.pixelformat) == PixelFormat::kUnknown ||
         pix.width == 0 || pix.height == 0 || pix.width > 16384 || pix.height > 16384 || pix.bytesperline == 0 || pix.sizeimage == 0) {
@@ -189,8 +150,12 @@ CaptureOpenResult V4L2VideoCapture::Open() {
         return failed({CaptureErrorCategory::Unsupported, 0, "Device has no configurable frame interval", false});
     }
     parameters.parm.capture.timeperframe = {static_cast<unsigned int>(config_.frame_rate.den), static_cast<unsigned int>(config_.frame_rate.num)};
-    if (Ioctl(device_fd_, VIDIOC_S_PARM, &parameters) < 0) return failed(NativeError("S_PARM", errno));
-    if (Ioctl(device_fd_, VIDIOC_G_PARM, &parameters) < 0) return failed(NativeError("G_PARM", errno));
+    if (Ioctl(device_fd_, VIDIOC_S_PARM, &parameters) < 0) {
+        return failed(NativeError("S_PARM", errno));
+    }
+    if (Ioctl(device_fd_, VIDIOC_G_PARM, &parameters) < 0) {
+        return failed(NativeError("G_PARM", errno));
+    }
     const auto interval = parameters.parm.capture.timeperframe;
     if (interval.numerator == 0 || interval.denominator == 0 || interval.numerator > INT_MAX || interval.denominator > INT_MAX ||
         (!config_.allow_negotiation && static_cast<uint64_t>(interval.numerator) * config_.frame_rate.num != static_cast<uint64_t>(interval.denominator) * config_.frame_rate.den)) {
@@ -202,43 +167,30 @@ CaptureOpenResult V4L2VideoCapture::Open() {
         {static_cast<int>(interval.denominator), static_cast<int>(interval.numerator)},
         pix.bytesperline, pix.sizeimage, 0, pix.colorspace, pix.ycbcr_enc, pix.quantization, pix.xfer_func};
 
-    // 请求视频采集缓冲区
-    v4l2_requestbuffers request{};
-    request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    request.memory = V4L2_MEMORY_MMAP;
-    request.count = config_.buffer_count;
-    if (Ioctl(device_fd_, VIDIOC_REQBUFS, &request) < 0) return failed(NativeError("REQBUFS", errno));
-    if (request.count < 2 || request.count > 64) {
-        return failed({CaptureErrorCategory::Unsupported, 0, "Invalid returned capture buffer count", false});
-    }
-    info_.buffer_count = request.count;
     try {
-        pool_->mappings.reserve(request.count);
-        for (unsigned int index = 0; index < request.count; ++index) {
-            if (stop_requested_.load()) return failed({CaptureErrorCategory::Cancelled, 0, "Capture open cancelled", false});
-            v4l2_buffer buffer{};
-            buffer.type = request.type;
-            buffer.memory = request.memory;
-            buffer.index = index;
-            if (Ioctl(device_fd_, VIDIOC_QUERYBUF, &buffer) < 0) return failed(NativeError("QUERYBUF", errno));
-            if (buffer.length < info_.size_image) {
-                return failed({CaptureErrorCategory::InvalidFrame, 0, "Mapped buffer is smaller than sizeimage", false});
-            }
-            void* address = ::mmap(nullptr, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd_, buffer.m.offset);
-            if (address == MAP_FAILED) return failed(NativeError("mmap", errno));
-            pool_->mappings.push_back({address, buffer.length});
-            if (Ioctl(device_fd_, VIDIOC_QBUF, &buffer) < 0) return failed(NativeError("initial QBUF", errno));
+        queue_ = std::make_shared<CaptureQueue>(device_fd_);
+        if (const int error = queue_->Initialize(config_.buffer_count, info_.size_image)) {
+            return failed(NativeError("initialize capture queue", error));
         }
+        info_.buffer_count = queue_->Count();
+    } catch (const std::system_error& error) {
+        return failed(NativeError("initialize capture queue", error.code().value()));
     } catch (...) {
         cleanup();
         stop_requested_.store(true);
         throw;
     }
+
     auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (stop_requested_.load()) return failed({CaptureErrorCategory::Cancelled, 0, "Capture open cancelled", false});
-    if (Ioctl(device_fd_, VIDIOC_STREAMON, &type) < 0) return failed(NativeError("STREAMON", errno));
+    if (stop_requested_.load()) {
+        LOG_WARN("Capture open cancelled");
+        return failed({CaptureErrorCategory::Cancelled, 0, "Capture open cancelled", false});
+    }
+    if (Ioctl(device_fd_, VIDIOC_STREAMON, &type) < 0) {
+        LOG_ERROR("Failed to start streaming: {}", errno);
+        return failed(NativeError("STREAMON", errno));
+    }
     streaming_ = true;
-    pool_->active = true;
     return {};
 }
 
@@ -248,11 +200,17 @@ CaptureReadResult V4L2VideoCapture::ReadFrame() {
         return {CaptureReadStatus::Stopped, nullptr, std::nullopt};
     }
 
-    // poll 事件循环
-    pollfd descriptors[2]{{device_fd_, POLLIN, 0}, {wake_fd_, POLLIN, 0}};
+    // 归还上一轮用完的buffer
+    if (const int error = queue_->DrainReturns()) {
+        return ReadFailure(NativeError("recycle QBUF", error));
+    }
+
+    // 三路 poll: device_fd_ v4l2视频数据就绪，wake_fd_ 用于接收上层的请求停止采集视频事件，queue_->WakeFd() 用于接收归还事件
+    pollfd descriptors[3]{{queue_->HasQueued() ? device_fd_ : -1, POLLIN, 0},   // HasQueued为false表示所有的slot都被消费者占用, 不再等待视频帧事件
+                          {wake_fd_, POLLIN, 0}, {queue_->WakeFd(), POLLIN, 0}};
     int result;
     do {
-        result = ::poll(descriptors, 2, static_cast<int>(config_.poll_timeout.count()));
+        result = ::poll(descriptors, 3, static_cast<int>(config_.poll_timeout.count()));
     } while (result < 0 && errno == EINTR && !stop_requested_.load());
     if (stop_requested_.load() || descriptors[1].revents & POLLIN) {
         // 唤醒文件描述符被触发，说明上层请求停止采集视频
@@ -266,6 +224,15 @@ CaptureReadResult V4L2VideoCapture::ReadFrame() {
     if (result == 0) {
         return {CaptureReadStatus::NoData, nullptr, std::nullopt};
     }
+    // 归还事件触发
+    if (descriptors[2].revents & POLLIN) {
+        if (const int error = queue_->DrainReturns()) {
+            return ReadFailure(NativeError("recycle QBUF", error));
+        }
+        if (!(descriptors[0].revents & POLLIN)) {
+            return {CaptureReadStatus::NoData, nullptr, std::nullopt};  // 没有视频数据就绪, 直接返回空
+        }
+    }
     // 设备异常事件
     if (descriptors[0].revents & (POLLHUP | POLLNVAL | POLLERR)) {
         return ReadFailure({CaptureErrorCategory::DeviceDisconnected, 0, "Capture poll reported device failure", true});
@@ -274,40 +241,58 @@ CaptureReadResult V4L2VideoCapture::ReadFrame() {
 
     // 出队缓冲区 DQBUF 操作
     v4l2_buffer buffer{};
-    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buffer.memory = V4L2_MEMORY_MMAP;   // 映射内存
-    if (Ioctl(device_fd_, VIDIOC_DQBUF, &buffer) < 0) {
-        if (errno == EAGAIN) {
-            return {CaptureReadStatus::NoData, nullptr, std::nullopt};
+    std::shared_ptr<FrameLease> lease;
+    if (const int error = queue_->Dequeue(buffer, lease)) {
+        if (error == EAGAIN) {
+            return {CaptureReadStatus::NoData, nullptr, std::nullopt};  // 被抢先了, 直接返回空
         }
-        return ReadFailure(NativeError("DQBUF", errno));
-    }
-    if (buffer.index >= pool_->mappings.size()) {
-        return ReadFailure({CaptureErrorCategory::InvalidFrame, 0, "Driver returned invalid buffer index", false});
+        if (error == EPROTO) {
+            LOG_WARN("Driver returned invalid capture buffer index, state or size: {}", error);
+            return ReadFailure({CaptureErrorCategory::InvalidFrame, error,
+                "Driver returned invalid capture buffer index, state or size", false});
+        }
+        return ReadFailure(NativeError("DQBUF", error));
     }
 
-    // 处理捕获到的视频帧,复制视频帧数据到 MediaFrame
-    const auto captured = buffer;
-    auto guard = std::make_shared<DeferredBufferReturn>();
-    guard->return_buffer = [pool = pool_, captured] { pool->Return(captured); };
-    auto buffer_ptr = std::shared_ptr<const uint8_t>(
-        static_cast<const uint8_t*>(pool_->mappings[buffer.index].address),
-        [guard](const uint8_t*) {});  // guard 被 custom deleter 持有，QBUF 在 shared_ptr 析构时自动触发
+    // 处理视频数据
+    const auto& captured = buffer;   // 拷贝一份快照，避免修改原始数据，目前可以不需要拷贝，创建引用，后续需要修改buffer时需要改为拷贝
 
     std::shared_ptr<MediaFrame> frame;
     std::optional<CaptureError> copy_error;
     try {
         if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
+            LOG_WARN("Driver marked capture frame damaged");
             throw std::invalid_argument("Driver marked capture frame damaged");
         }
         if (buffer.field != V4L2_FIELD_NONE) {
+            LOG_WARN("Captured frame is not progressive");
             throw std::invalid_argument("Captured frame is not progressive");
         }
-        if (buffer.bytesused > pool_->mappings[buffer.index].length) {
-            throw std::invalid_argument("bytesused exceeds mapped buffer");
+
+        if (config_.delivery_mode == V4L2DeliveryMode::Copy) {
+            frame = MediaFrame::CreateCompact(lease->Data(), lease->Size(), info_.pixel_format, info_.width, info_.height, static_cast<int>(info_.bytes_per_line));
+        } else {
+            const auto layout = SourcePlaneLayout::Compute(info_.pixel_format, info_.width, info_.height, static_cast<int>(info_.bytes_per_line));
+            if (layout.is_empty()) {
+                throw std::invalid_argument("Invalid leased frame layout");
+            }
+            VideoFrameMeta meta{};
+            meta.width = info_.width;
+            meta.height = info_.height;
+            meta.pixel_format = info_.pixel_format;
+            meta.plane_count = layout.plane_count;
+            for (int i = 0; i < layout.plane_count; ++i) {
+                const auto& plane = layout.planes[i];
+                const auto span = static_cast<std::size_t>(plane.rows - 1) * plane.source_stride + plane.row_bytes;
+                if (plane.source_offset > INT_MAX || span > INT_MAX || plane.source_offset > lease->Size() || span > lease->Size() - plane.source_offset) {
+                    throw std::invalid_argument("Truncated leased frame plane");
+                }                    
+                meta.plane_info[i] = {static_cast<int>(plane.source_offset), plane.source_stride, static_cast<int>(span)};
+            }
+            frame = std::make_shared<MediaFrame>();
+            frame->meta = meta;
+            frame->buffer = lease;
         }
-        frame = MediaFrame::CreateCompact(std::move(buffer_ptr), buffer.bytesused,
-            info_.pixel_format, info_.width, info_.height, static_cast<int>(info_.bytes_per_line));
         if (!frame) {
             copy_error = CaptureError{CaptureErrorCategory::InvalidFrame, 0, "CreateCompact failed", false};
         }
@@ -317,11 +302,10 @@ CaptureReadResult V4L2VideoCapture::ReadFrame() {
         copy_error = CaptureError{CaptureErrorCategory::System, 0, "Capture copy failed", false};
     }
     
-    // QBUF 由 buffer_ptr 的 custom deleter 自动管理：
-    //   零拷贝路径：SimpleBufferView 持有 shared_ptr -> 帧释放时 QBUF
-    //   拷贝/失败路径：shared_ptr 在此作用域析构 -> 立即 QBUF
-    //   异常路径：  栈展开 -> 立即 QBUF
-    
+    lease.reset();
+    if (const int error = queue_->DrainReturns()) {
+        return ReadFailure(NativeError("recycle QBUF", error));
+    }
     if (copy_error) {
         return ReadFailure(std::move(*copy_error));
     }
@@ -360,13 +344,28 @@ CaptureVideoInfo V4L2VideoCapture::GetVideoInfo() const {
 }
 
 void V4L2VideoCapture::cleanup() noexcept {
-    if (pool_) pool_->Stop();
+    if (streaming_) {
+        auto type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (Ioctl(device_fd_, VIDIOC_STREAMOFF, &type) < 0) {
+            LOG_WARN("Capture STREAMOFF failed: {}", std::strerror(errno));
+        }
+    }
     streaming_ = false;
-    pool_.reset();
+    if (queue_) {
+        if (const int error = queue_->Retire()) {
+            LOG_WARN("Cannot release capture queue (driver may not support orphaned buffers): {}", std::strerror(error));
+        }
+        queue_.reset();
+    }
+    if (device_fd_ >= 0) {
+        ::close(device_fd_);
+    }
     device_fd_ = -1;
     {
         std::lock_guard<std::mutex> lock(wake_mutex_);
-        if (wake_fd_ >= 0) ::close(wake_fd_);
+        if (wake_fd_ >= 0) {
+            ::close(wake_fd_);
+        }
         wake_fd_ = -1;
     }
     info_ = {};

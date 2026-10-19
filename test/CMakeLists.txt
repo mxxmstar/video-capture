@@ -44,4 +44,5 @@ endif()
 
 if(BUILD_RENDER)
     add_subdirectory(render)
+    add_subdirectory(v4l2-demo)
 endif()
