@@ -8,6 +8,19 @@
 #include <iostream>
 #include <utility>
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define RENDER_HAS_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define RENDER_HAS_SANITIZER 1
+#endif
+#if RENDER_HAS_SANITIZER && defined(__linux__)
+extern "C" void __lsan_disable(void) __attribute__((weak));
+extern "C" void __lsan_enable(void) __attribute__((weak));
+#endif
+
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
@@ -111,6 +124,7 @@ bool OpenGLVideoRenderer::Init(const RenderConfig& config) {
         return false;
     }
     config_ = config;
+    dmabuf_import_disabled_ = false;
     last_error_.clear();
     if (!createWindow() || !createProgram() || !createQuad()) {
         Shutdown();
@@ -139,6 +153,11 @@ bool OpenGLVideoRenderer::Render(const MediaFrame& frame) {
     if (!uploadVideoTextures(frame, shader_format)) {
         return false;
     }
+
+    return drawVideoTextures(shader_format);
+}
+
+bool OpenGLVideoRenderer::drawVideoTextures(int shader_format) {
 
     int fb_width = 0;
     int fb_height = 0;
@@ -213,7 +232,15 @@ void OpenGLVideoRenderer::Shutdown() {
 }
 
 bool OpenGLVideoRenderer::createWindow() {
+#if RENDER_HAS_SANITIZER && defined(__linux__)
+    // libX11's XimOpenIM keeps a process-lifetime cache that LeakSanitizer
+    // cannot reclaim. Exclude only the GLFW/X11 bootstrap from leak tracking.
+    if (__lsan_disable) __lsan_disable();
+#endif
     if (glfw_users == 0 && !glfwInit()) {
+#if RENDER_HAS_SANITIZER && defined(__linux__)
+        if (__lsan_enable) __lsan_enable();
+#endif
         setError("failed to initialize GLFW");
         return false;
     }
@@ -225,6 +252,9 @@ bool OpenGLVideoRenderer::createWindow() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#ifdef RENDER_EGL_DMABUF
+    glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+#endif
     glfwWindowHint(GLFW_VISIBLE, config_.visible ? GLFW_TRUE : GLFW_FALSE);
 
     window_ = glfwCreateWindow(config_.window_width,
@@ -232,6 +262,17 @@ bool OpenGLVideoRenderer::createWindow() {
                                config_.title.c_str(),
                                nullptr,
                                nullptr);
+#ifdef RENDER_EGL_DMABUF
+    if (!window_) {
+        // Preserve ordinary texture rendering on systems without a working EGL context.
+        glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_NATIVE_CONTEXT_API);
+        window_ = glfwCreateWindow(config_.window_width, config_.window_height,
+                                   config_.title.c_str(), nullptr, nullptr);
+    }
+#endif
+#if RENDER_HAS_SANITIZER && defined(__linux__)
+    if (__lsan_enable) __lsan_enable();
+#endif
     if (!window_) {
         setError("failed to create GLFW window");
         return false;

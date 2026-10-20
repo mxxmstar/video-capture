@@ -9,6 +9,23 @@ struct GLFWwindow;
 
 namespace render {
 
+/// @brief DMA-BUF 视频平面。
+struct DmaBufPlane {
+    int fd{-1};
+    int offset{0};
+    int pitch{0};
+    std::size_t size{0};    ///< 整个文件描述符分配的大小，非使用大小。
+};
+
+/// @brief DMA-BUF 视频帧。
+struct DmaBufVideoFrame {
+    int width{0};
+    int height{0};
+    PixelFormat format{PixelFormat::kUnknown};
+    std::uint64_t modifier{0}; // 仅支持 DRM_FORMAT_MOD_LINEAR，不支持分块/压缩布局
+    std::vector<DmaBufPlane> planes; // 平面布局
+};
+
 /// @brief 基于 GLFW + GLAD + OpenGL 3.3 的本地视频窗口渲染器。
 ///
 /// 渲染路径：
@@ -29,6 +46,14 @@ public:
     bool Init(const RenderConfig& config) override;
     /// @brief 渲染一帧视频。
     bool Render(const MediaFrame& frame) override;
+    
+    /// @brief 渲染一帧 DMA-BUF 视频。
+    /// @param frame DMA-BUF 视频帧。
+    /// @param allow_cpu_fallback 是否允许 CPU 回退到纹理上传。
+    /// @return 是否成功渲染。
+    bool RenderDmaBuf(const DmaBufVideoFrame& frame, bool allow_cpu_fallback = true);
+    bool LastDmaBufWasImported() const { return last_dmabuf_imported_; }
+    const std::string& DmaBufImportError() const { return dmabuf_import_error_; }
     /// @brief 轮询 GLFW 事件，处理窗口关闭和键盘事件。
     void PollEvents() override;
     /// @brief 判断窗口是否已经请求关闭。
@@ -38,6 +63,10 @@ public:
     const std::string& LastError() const { return last_error_; }
 
 private:
+    bool drawVideoTextures(int shader_format);
+    bool last_dmabuf_imported_{false};
+    bool dmabuf_import_disabled_{false};    ///< 是否禁用 DMA-BUF 导入，首次导入失败后设置为 true，防止后续导入
+    std::string dmabuf_import_error_;    ///< DMA-BUF 导入错误信息
     /// @brief 初始化 GLFW、创建窗口并加载 OpenGL 函数指针。
     bool createWindow();
 

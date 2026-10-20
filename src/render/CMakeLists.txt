@@ -10,6 +10,14 @@ target_link_libraries(render_lib
     PUBLIC common_lib
     PRIVATE OpenGL::GL glfw glad::glad)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(OpenGL QUIET COMPONENTS EGL)
+    if(TARGET OpenGL::EGL)
+        target_link_libraries(render_lib PRIVATE OpenGL::EGL)
+        target_compile_definitions(render_lib PRIVATE RENDER_EGL_DMABUF=1)
+    endif()
+endif()
+
 target_compile_options(render_lib PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX->
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
