@@ -118,6 +118,14 @@ std::shared_ptr<MediaFrame> MediaFrame::CreateCompact(std::shared_ptr<const uint
 
     if (compact_layout) {
         frame->buffer = std::make_shared<SimpleBufferView>(std::move(source_data), total);
+        std::vector<MediaPlaneView> views;
+        for (int p = 0; p < layout.plane_count; ++p) {
+            const auto& pl = layout.planes[p];
+            views.emplace_back(frame->buffer->Data() + meta.plane_info[p].offset,
+                static_cast<std::size_t>(meta.plane_info[p].size),
+                PlaneGeometry{meta.plane_info[p].stride, static_cast<std::size_t>(pl.row_bytes), static_cast<std::size_t>(pl.rows)});
+        }
+        frame->view = MediaBufferView(std::move(views), frame->buffer);
     } else {
         std::vector<uint8_t> packed(total);
         const uint8_t* src = source_data.get();
@@ -131,6 +139,14 @@ std::shared_ptr<MediaFrame> MediaFrame::CreateCompact(std::shared_ptr<const uint
             }
         }
         frame->buffer = std::make_shared<SimpleBuffer>(std::move(packed));
+        std::vector<MediaPlaneView> views;
+        for (int p = 0; p < layout.plane_count; ++p) {
+            const auto& pl = layout.planes[p];
+            views.emplace_back(frame->buffer->Data() + meta.plane_info[p].offset,
+                static_cast<std::size_t>(meta.plane_info[p].size),
+                PlaneGeometry{meta.plane_info[p].stride, static_cast<std::size_t>(pl.row_bytes), static_cast<std::size_t>(pl.rows)});
+        }
+        frame->view = MediaBufferView(std::move(views), frame->buffer);
     }
 
     frame->time = {kNoTimestamp, kNoTimestamp, kNoTimestamp};
@@ -253,6 +269,13 @@ std::shared_ptr<MediaFrame> MediaFrame::CreateCompact(const unsigned char* sourc
 
 PlaneSlice MediaFrame::GetPlaneSlice(int plane_index) const {
     const auto* vm = VideoMeta();
+    if (vm && plane_index >= 0 && static_cast<std::size_t>(plane_index) < view.PlaneCount()) {
+        const auto* plane = view.Plane(static_cast<std::size_t>(plane_index));
+        if (!plane || !plane->data || plane->geometry.stride <= 0 || plane->geometry.row_bytes == 0 || plane->geometry.rows == 0) return {};
+        const auto stride = static_cast<std::size_t>(plane->geometry.stride);
+        if ((plane->geometry.rows - 1) * stride > plane->size || plane->geometry.row_bytes > plane->size - (plane->geometry.rows - 1) * stride) return {};
+        return {plane->data, static_cast<int>(plane->geometry.stride), static_cast<int>(plane->geometry.row_bytes), static_cast<int>(plane->geometry.rows)};
+    }
     if (!vm || plane_index < 0 || plane_index >= vm->plane_count) {
         return {};
     }

@@ -20,8 +20,9 @@ public:
     };
 
     /// @brief 构造函数
-    /// @param borrowed_fd 已打开的V4L2设备描述符    
-    explicit CaptureQueue(int borrowed_fd);
+    /// @param borrowed_fd 已打开的V4L2设备描述符
+    /// @param buffer_type V4L2缓冲区类型（单平面或多平面）
+    explicit CaptureQueue(int borrowed_fd, unsigned buffer_type);
     ~CaptureQueue();
     CaptureQueue(const CaptureQueue&) = delete;
     CaptureQueue& operator=(const CaptureQueue&) = delete;
@@ -29,8 +30,9 @@ public:
     /// @brief 请求 count 个缓冲区，每个缓冲区大小为 minimum_size 字节，全部 VIDIOC_QBUF 入队
     /// @param count 缓冲区数量
     /// @param minimum_size 缓冲区最小大小
+    /// @param plane_geometry 各平面的几何信息（stride、size、rows）
     /// @return 0 成功，其他值 失败
-    int Initialize(unsigned count, unsigned minimum_size);
+    int Initialize(unsigned count, unsigned minimum_size, std::vector<PlaneGeometry> plane_geometry);
 
     /// @brief 从内核中出队一个已经填充视频数据的缓冲区
     /// @param buffer 缓冲区结构体
@@ -62,10 +64,12 @@ private:
     void release(unsigned index, std::uint64_t generation) noexcept;
     int fd_;    ///< 已打开的V4L2设备描述符
     int wake_fd_{-1};    ///< 用于唤醒消费者线程的事件文件描述符
+    const unsigned buffer_type_;    ///< V4L2缓冲区类型（单/多平面）
     const std::uint64_t generation_;    ///< 当前 capture_queue 的代际号
     mutable std::mutex mutex_;  ///< 缓冲区状态操作互斥锁
     bool active_{true}; ///< 是否运行中
     int error_{0};  ///< 最近一次操作的错误码
     std::vector<SlotState> slots_;  ///< 保存每个缓冲区的状态
     std::shared_ptr<MmapBufferPool> storage_;   ///< 缓冲区存储池
+    std::vector<PlaneGeometry> plane_geometry_; ///< 各平面几何信息
 };

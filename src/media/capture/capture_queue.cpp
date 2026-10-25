@@ -6,7 +6,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
+#include <array>
 namespace {
 std::atomic<std::uint64_t> next_generation{1};
 /// @brief 调用 ioctl 函数，处理 EINTR 错误
@@ -21,16 +21,9 @@ int Ioctl(int fd, unsigned long command, void* argument) {
     } while (result < 0 && errno == EINTR);
     return result;
 }
-v4l2_buffer Buffer(unsigned index = 0) {
-    v4l2_buffer buffer{};
-    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buffer.memory = V4L2_MEMORY_MMAP;
-    buffer.index = index;
-    return buffer;
 }
-}
-
-CaptureQueue::CaptureQueue(int borrowed_fd) : fd_(borrowed_fd), generation_(next_generation.fetch_add(1)),
+CaptureQueue::CaptureQueue(int borrowed_fd, unsigned buffer_type)
+    : fd_(borrowed_fd), buffer_type_(buffer_type), generation_(next_generation.fetch_add(1)),
     storage_(std::make_shared<MmapBufferPool>()) {
     wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);    // 非阻塞，关闭时自动关闭
     if (wake_fd_ < 0) {
@@ -45,9 +38,11 @@ CaptureQueue::~CaptureQueue() {
     }
 }
 
-int CaptureQueue::Initialize(unsigned count, unsigned minimum_size) {
+int CaptureQueue::Initialize(unsigned count, unsigned minimum_size, std::vector<PlaneGeometry> plane_geometry) {
+    plane_geometry_ = std::move(plane_geometry);
+    // 向内核查询
     v4l2_requestbuffers request{};
-    request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    request.type = buffer_type_;
     request.memory = V4L2_MEMORY_MMAP;
     request.count = count;
     if (Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0) {
@@ -60,21 +55,52 @@ int CaptureQueue::Initialize(unsigned count, unsigned minimum_size) {
     }
     LOG_INFO("Initialized queue with {} buffers", request.count);
     slots_.assign(request.count, SlotState::Retired);
+    storage_->ResizeSlots(request.count);
 
+    const bool is_mplane = (buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
     for (unsigned index = 0; index < request.count; ++index) {
-        auto buffer = Buffer(index);
+        std::array<v4l2_plane, VIDEO_MAX_PLANES> planes{};
+        v4l2_buffer buffer{};
+        buffer.type = buffer_type_;
+        buffer.memory = V4L2_MEMORY_MMAP;
+        buffer.index = index;
+        if (is_mplane) {
+            buffer.length = VIDEO_MAX_PLANES;
+            buffer.m.planes = planes.data();
+        }
         if (Ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0) {
             LOG_ERROR("Failed to query buffer {} from kernel: {}", index, errno);
             return errno;
         }
-        if (buffer.length < minimum_size) {
-            LOG_ERROR("Buffer-{} length {} is too small, minimum size is {}", index, buffer.length, minimum_size);
-            return EPROTO;
+
+        if (is_mplane) {
+            std::size_t total_length = 0;
+            for (unsigned plane_index = 0; plane_index < buffer.length; ++plane_index) {
+                total_length += planes[plane_index].length;
+
+                const int error = storage_->Map(fd_, index, planes[plane_index].length, planes[plane_index].m.mem_offset);
+                if (error) {
+                    LOG_ERROR("Failed to map plane {} of buffer {} to memory: {}", plane_index, index, error);
+                    return error;
+                }
+            }
+            if (total_length < minimum_size) {
+                LOG_ERROR("Buffer-{} total length {} is too small, minimum size is {}", index, total_length, minimum_size);
+                return EPROTO;
+            }
+        } else {
+            if (buffer.length < minimum_size) {
+                LOG_ERROR("Buffer-{} length {} is too small, minimum size is {}", index, buffer.length, minimum_size);
+                return EPROTO;
+            }
+            const int error = storage_->Map(fd_, index, buffer.length, buffer.m.offset);
+            if (error) {
+                LOG_ERROR("Failed to map buffer {} to memory: {}", index, error);
+                return error;
+            }
         }
-        if (const int error = storage_->Map(fd_, buffer.length, buffer.m.offset)) {
-            LOG_ERROR("Failed to map buffer {} to memory: {}", index, error);
-            return error;
-        }
+
+        // 将 buffer 入队到内核队列
         if (Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
             LOG_ERROR("Failed to queue buffer {} to kernel: {}", index, errno);
             return errno;
@@ -85,8 +111,15 @@ int CaptureQueue::Initialize(unsigned count, unsigned minimum_size) {
 }
 
 int CaptureQueue::Dequeue(v4l2_buffer& buffer, std::shared_ptr<FrameLease>& lease) {
-    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    const bool is_mplane = (buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+    
+    std::array<v4l2_plane, VIDEO_MAX_PLANES> planes{};
+    buffer.type   = buffer_type_;
     buffer.memory = V4L2_MEMORY_MMAP;
+    if (is_mplane) {
+        buffer.length = VIDEO_MAX_PLANES;
+        buffer.m.planes = planes.data();
+    }
     if (Ioctl(fd_, VIDIOC_DQBUF, &buffer) < 0) {
         LOG_ERROR("Failed to dequeue buffer from kernel: {}", errno);
         return errno;
@@ -95,17 +128,44 @@ int CaptureQueue::Dequeue(v4l2_buffer& buffer, std::shared_ptr<FrameLease>& leas
     if (!active_ || buffer.index >= slots_.size() || slots_[buffer.index] != SlotState::Queued) {
         LOG_ERROR("Invalid buffer index {} from kernel: {}", buffer.index, errno);
         return error_ = EPROTO;
-    }        
-    slots_[buffer.index] = SlotState::Leased;   // 标记为出队
-    const auto& mapping = storage_->At(buffer.index);
-    if (buffer.bytesused > mapping.length) {
-        slots_[buffer.index] = SlotState::RecyclePending;   // 归还到队列
-        return EPROTO;
     }
-    // Allocate while the slot is leased; on failure the next read recycles it.
+    slots_[buffer.index] = SlotState::Leased;   // 标记为出队
+    
+    // 检查 bytesused 是否超过映射内存长度
+    const auto& frame_mapping = storage_->At(buffer.index);
+    std::size_t buf_bytesused = 0;
+    std::vector<MediaPlaneView> views;
+    if (is_mplane) {
+        for (unsigned plane_index = 0; plane_index < buffer.length; ++plane_index) {
+            if (planes[plane_index].bytesused > frame_mapping[plane_index].length) {
+                LOG_ERROR("Plane {} bytesused {} exceeds mapped length {}", plane_index, planes[plane_index].bytesused, frame_mapping[plane_index].length);
+                slots_[buffer.index] = SlotState::RecyclePending;
+                return EPROTO;
+            }
+            const auto& geo = plane_geometry_[plane_index];
+            views.push_back(MediaPlaneView{
+                static_cast<uint8_t*>(frame_mapping[plane_index].address),
+                planes[plane_index].bytesused,
+                geo});
+            buf_bytesused += planes[plane_index].bytesused;
+        }
+    } else {
+        buf_bytesused = buffer.bytesused;
+        if (buf_bytesused > frame_mapping[0].length) {
+            LOG_ERROR("Kernel bytesused {} exceeds mapped memory length {}", buf_bytesused, frame_mapping[0].length);
+            slots_[buffer.index] = SlotState::RecyclePending;
+            return EPROTO;
+        }
+        const auto& geo = plane_geometry_[0];
+        views.push_back(MediaPlaneView{
+            static_cast<uint8_t*>(frame_mapping[0].address),
+            buf_bytesused,
+            geo});
+    }
+    
+    // 构造 FrameLease
     try {
-        auto* raw = new FrameLease(shared_from_this(), storage_, buffer.index, generation_, 
-            static_cast<uint8_t*>(mapping.address), buffer.bytesused);
+        auto* raw = new FrameLease(shared_from_this(), storage_, buffer.index, generation_, std::move(views));
         lock.unlock();
         lease.reset(raw); // shared_ptr deletes raw (and signals Release) if allocation fails.
     } catch (...) {
@@ -148,12 +208,32 @@ int CaptureQueue::DrainReturns() {
     if (!active_) {
         return ECANCELED;
     }
+
     // 遍历所有缓冲区，将被释放的缓冲区重新入队
+    const bool is_mplane = (buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
     for (unsigned index = 0; index < slots_.size(); ++index) {
         if (slots_[index] != SlotState::RecyclePending) {
             continue;
         }
-        auto buffer = Buffer(index);
+        
+        const auto& frame_planes = storage_->At(index);
+        v4l2_buffer buffer{};
+        buffer.type = buffer_type_;
+        buffer.memory   = V4L2_MEMORY_MMAP;
+        buffer.index    = index;
+        if (is_mplane) {
+            uint32_t plane_count = static_cast<uint32_t>(frame_planes.size());
+            buffer.length = plane_count;
+            std::array<v4l2_plane, VIDEO_MAX_PLANES> planes{};
+            for (unsigned plane_index = 0; plane_index < plane_count; ++plane_index) {
+                planes[plane_index].length = static_cast<__u32>(frame_planes[plane_index].length);
+                planes[plane_index].m.mem_offset = frame_planes[plane_index].offset;
+            }
+            buffer.m.planes = planes.data();
+        } else {
+            buffer.length = static_cast<__u32>(frame_planes[0].length);
+        }
+        
         if (Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
             return error_ = errno;
         }
@@ -182,7 +262,7 @@ int CaptureQueue::Retire() noexcept {
     // 取消所有映射
     storage_.reset();
     v4l2_requestbuffers request{};
-    request.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    request.type = buffer_type_;
     request.memory = V4L2_MEMORY_MMAP;
     const int error = Ioctl(fd_, VIDIOC_REQBUFS, &request) < 0 ? errno : 0;
     fd_ = -1;

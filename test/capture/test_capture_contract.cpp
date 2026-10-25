@@ -49,16 +49,16 @@ void TestLayout(PixelFormat format) {
     info.width = 4;
     info.height = 2;
     info.pixel_format = format;
-    info.bytes_per_line = format == PixelFormat::kYUYV422 ? 12 : 8;
+    const int source_stride = format == PixelFormat::kYUYV422 ? 12 : 8;
     std::vector<unsigned char> source(24, 0xee);
     for (std::size_t i = 0; i < source.size(); ++i) source[i] = static_cast<unsigned char>(i);
     const auto frame = MediaFrame::CreateCompact(source.data(), source.size(),
                                       info.pixel_format, 4, info.height,
-                                      info.bytes_per_line);
+                                      source_stride);
     const auto* meta = frame->VideoMeta();
     Require(frame->buffer->Size() == (format == PixelFormat::kYUYV422 ? 16U : 12U), "Packed size");
     Require(frame->Stride(0) == (format == PixelFormat::kYUYV422 ? 8 : 4), "Packed stride");
-    Require(frame->buffer->Data()[frame->Stride(0)] == source[info.bytes_per_line], "Padding was copied as pixels");
+    Require(frame->buffer->Data()[frame->Stride(0)] == source[source_stride], "Padding was copied as pixels");
     if (format != PixelFormat::kYUYV422) {
         Require(frame->buffer->Data()[meta->plane_info[1].offset] == source[16], "UV offset");
         if (format == PixelFormat::kI420) {
@@ -69,7 +69,7 @@ void TestLayout(PixelFormat format) {
     source[0] = 255;
     Require(frame->buffer->Data()[0] == original, "Frame borrows source storage");
     Require(!MediaFrame::CreateCompact(source.data(), 1, info.pixel_format, 4,
-        info.height, info.bytes_per_line), "Truncated frame accepted");
+        info.height, source_stride), "Truncated frame accepted");
 }
 }
 

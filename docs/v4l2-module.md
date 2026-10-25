@@ -4,6 +4,38 @@
 本阶段支持单个 V4L2 memory plane 的 MMAP 采集，像素格式为 YUYV、NV12、I420。
 NV12/I420 的图像平面仍位于同一个 V4L2 缓冲区中，不等于 `VIDEO_CAPTURE_MPLANE`。
 
+## 参数定义与介绍
+**1. 参数定义对比**
+|V4L2 参数	|PlaneGeometry 参数|说明|
+| --- | --- | --- |
+|bytes_per_line	|stride	|每行字节数（包含对齐填充）|
+|size_image	|无直接对应	|整帧总字节数|
+|height	|rows	|行数|
+|width * bytes_per_pixel	|row_bytes	|每行有效字节数|
+
+**2. 核心关系公式**
+```cpp
+// 单平面格式（如 YUYV422）
+bytes_per_line = stride                    // 每行字节数（含填充）
+size_image = bytes_per_line × height       // 总字节数
+
+// 多平面格式（如 NV12、I420）
+// Y 平面
+bytes_per_line = stride_y                  // Y 平面每行字节数
+size_image_y = bytes_per_line × height     // Y 平面总字节数
+
+// UV 平面（NV12 为例）
+uv_stride = bytes_per_line                 // UV 平面 stride 通常与 Y 相同
+size_image_uv = uv_stride × (height / 2)   // UV 平面总字节数
+
+// I420的 uv 平面（I420 为例）
+u_stride(v) = bytes_per_line / 2             // U/V 平面 stride 通常与 Y 相同
+size_image_u(v) = u_stride(v) × (height / 2)   // U/V 平面总字节数
+
+// 整个帧
+size_image = size_image_y + size_image_uv  // 所有平面字节数之和
+```
+
 ## 职责和所有权
 
 | 对象 | 负责 | 生命周期结束时 |

@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <variant>
 #include <memory>
-#include "i_media_buffer.h"
+#include "media_buffer.h"
 #include "media_packet.h"
 
 /// 像素格式
@@ -109,8 +109,9 @@ public:
 
     // 普通帧通常由 SimpleBuffer 持有连续数据；FFmpeg 后端帧也可以由
     // FFmpegRawFrameBuffer 持有多平面 AVFrame，此时不能通过 Data()/Size()
-    // 访问整帧，而应使用 backend.ptr 或 raw buffer 的平面接口。
-    std::shared_ptr<IMediaBuffer> buffer;           ///< 媒体数据缓冲区
+    // 访问整帧，而应使用 backend.ptr 或 raw buffer 的平面接口。    
+    std::shared_ptr<IMediaBuffer> buffer;
+    MediaBufferView view;           ///< 媒体数据缓冲区    
     BackendHandle backend;                          ///< 所有权句柄
 
     /// @brief 将带 stride 填充的源数据紧凑打包为自描述的 MediaFrame（零拷贝版本）

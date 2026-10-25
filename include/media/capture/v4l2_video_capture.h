@@ -5,11 +5,14 @@
 #include <vector>
 
 #include "media/capture/i_video_capture.h"
+#include "media/media_buffer.h"
 
 /// @brief V4L2 视频捕获模式
 enum class V4L2DeliveryMode {
-    /// @brief 将有效行复制到独立紧凑缓冲区，拷贝结束后归还驱动 slot，与 buffer 完全解耦
+    /// @brief 将有效行复制，拷贝结束后归还驱动 slot，与 buffer 完全解耦
     Copy,
+    /// @brief 复制有效行到独立紧凑缓冲区，拷贝结束后归还驱动 slot，与 buffer 完全解耦
+    CopyCompact,
     /// @brief 不拷贝任何数据，MediaFrame 直接指向 buffer 内存
     MmapLease,
 };
@@ -25,10 +28,10 @@ struct V4L2CaptureConfig {
     unsigned int buffer_count{4};
     std::chrono::milliseconds poll_timeout{100};    
     bool allow_negotiation{false};  ///< 是否允许调整大小、格式或帧率
-    V4L2DeliveryMode delivery_mode{V4L2DeliveryMode::MmapLease};
+    V4L2DeliveryMode delivery_mode{V4L2DeliveryMode::MmapLease};    
 };
 
-// Linux single-memory-plane streaming capture with explicit delivery ownership.
+
 class V4L2VideoCapture final : public IVideoCapture {
 public:
     explicit V4L2VideoCapture(V4L2CaptureConfig config);
@@ -42,6 +45,9 @@ public:
     void Close() noexcept override;
     CaptureVideoInfo GetVideoInfo() const override;
 
+    /// @brief 获取视频帧几何信息
+    /// @return 视频帧平面几何信息
+    std::vector<PlaneGeometry> Geometry() const;
 private:
     void cleanup() noexcept;
     V4L2CaptureConfig config_;
@@ -51,6 +57,8 @@ private:
     int device_fd_{-1};                        ///< 视频设备文件描述符
     int wake_fd_{-1};                          ///< 唤醒文件描述符
     bool streaming_{false};                   ///< 是否正在流式传输
+    bool is_mplane_{false};                   ///< 是否为多平面设备
     std::shared_ptr<CaptureQueue> queue_;
     CaptureVideoInfo info_;
+    std::vector<PlaneGeometry> plane_geometry_;  ///< 视频帧平面几何信息
 };

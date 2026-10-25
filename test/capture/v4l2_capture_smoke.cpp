@@ -145,24 +145,24 @@ int main(int argc, char** argv) {
         OpenOrThrow(capture);
         const auto info = capture.GetVideoInfo();
         std::cout << "Negotiated " << info.width << 'x' << info.height
-            << " stride=" << info.bytes_per_line << " sizeimage=" << info.size_image
+            << " memory_planes=" << capture.Geometry().size() << " sizeimage=" << info.size_image
             << " buffers=" << info.buffer_count << " fps=" << info.frame_rate.toString() << '\n';
 
         // ========== 测试 1: 缓冲区复用——Close 后旧帧数据不被破坏 ==========
         auto first = ReadOrThrow(capture);
         Require(IsValidTimestamp(first.frame->time.pts_us), "Missing capture timestamp");
-        const auto saved = first.frame->buffer->Data()[0];    // 保存首字节校验值
+        const auto saved = first.frame->view.Data(0)[0];    // 保存首字节校验值
         for (int i = 0; i < 3; ++i) ReadOrThrow(capture);     // 取多帧触发复用
         capture.Close();
         // Close（REQBUFS(0) + munmap）后，由 shared_ptr<MmapBufferPool> 保护的旧帧映射仍有效
-        Require(first.frame->buffer->Data()[0] == saved, "Copy changed after requeue or Close");
+        Require(first.frame->view.Data(0)[0] == saved, "Copy changed after requeue or Close");
 
         // ========== 测试 2: 重复 open/close + 跨线程释放旧帧 ==========
         for (int i = 0; i < 5; ++i) {
             OpenOrThrow(capture);
             auto current = ReadOrThrow(capture);
             // 旧帧的 mmap 映射在 reopen 后不受影响（不同 generation 的队列相互独立）
-            if (first.frame) Require(first.frame->buffer->Data()[0] == saved, "Old mapping changed after reopen");
+            if (first.frame) Require(first.frame->view.Data(0)[0] == saved, "Old mapping changed after reopen");
             if (i == 0) {
                 // 在新队列活跃期间，从另一个线程释放旧帧——验证跨线程 Release 的安全性
                 auto old = std::move(first.frame);

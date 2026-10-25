@@ -95,7 +95,7 @@ void VideoCaptureSession::run() noexcept {
             if (result.status == CaptureReadStatus::Frame) {
                 if (!result.frame || !result.frame->buffer) {
                     fail({CaptureErrorCategory::InvalidFrame, 0, "Capture returned an empty frame", false});
-                    break;
+                    // break;
                 }
                 last_frame = std::chrono::steady_clock::now();
                 ++frames_;

@@ -46,9 +46,8 @@ struct CaptureVideoInfo {
     int width{0};                          // 帧宽度（像素）
     int height{0};                         // 帧高度（像素）
     PixelFormat pixel_format{PixelFormat::kUnknown};  // 像素格式（如 YUYV、MJPEG 等）
-    Rational frame_rate{0, 1};             // 帧率（分子/分母 表示，如 30/1 = 30fps）
-    unsigned int bytes_per_line{0};        // 每行字节数（含对齐填充，通常 > width * 每像素字节数）
-    unsigned int size_image{0};            // 单帧图像的总字节数
+    Rational frame_rate{0, 1};             // 帧率（分子/分母 表示，如 30/1 = 30fps）        
+    std::size_t size_image{0};            // 单帧图像的总字节数
     unsigned int buffer_count{0};          // 缓冲区数量（用于多缓冲/队列采集）
     unsigned int colorspace{0};            // V4L2 colorspace（如 sRGB、BT.709、BT.2020）
     unsigned int ycbcr_encoding{0};        // YCbCr 编码标准（如 BT.601、BT.709、BT.2020）
