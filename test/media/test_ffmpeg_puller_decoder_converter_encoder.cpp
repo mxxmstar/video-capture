@@ -252,7 +252,7 @@ int RunFfmpegConverterTest() {
     //   MediaFrame -> AVFrame -> sws/swr -> AVFrame -> MediaFrame
     //
     // 输入使用工程层的 MediaFrame，而不是直接把 AVFrame 交给底层转换器，
-    // 这样可以同时验证 MediaFrame 的元数据、平面信息和 buffer 是否能被
+    // 这样可以同时验证 MediaFrame 的元数据与平面视图是否能被
     // 正确适配到 FFmpeg。
     std::cout << "Running FFmpeg converter test" << std::endl;
 
@@ -261,8 +261,7 @@ int RunFfmpegConverterTest() {
     //
     //   [Y: 4x4 = 16 字节][U: 2x2 = 4 字节][V: 2x2 = 4 字节]
     //
-    // 这里的 offset/stride/size 就是 MediaFrame -> AVFrame 适配所依赖的
-    // 关键信息。
+    // 每个平面的几何和地址都由 MediaBufferView 提供。
     auto video_input = std::make_shared<MediaFrame>();
     video_input->type = MediaType::VIDEO;
     video_input->time.pts_us = 123;
@@ -273,10 +272,6 @@ int RunFfmpegConverterTest() {
     video_meta.pixel_format = PixelFormat::kI420;
     video_meta.width = 4;
     video_meta.height = 4;
-    video_meta.plane_count = 3;
-    video_meta.plane_info[0] = PlaneInfo{0, 4, 16};
-    video_meta.plane_info[1] = PlaneInfo{16, 2, 4};
-    video_meta.plane_info[2] = PlaneInfo{20, 2, 4};
     video_input->meta = video_meta;
 
     std::vector<uint8_t> video_data(24, 0);
@@ -286,7 +281,13 @@ int RunFfmpegConverterTest() {
     }
     std::fill(video_data.begin() + 16, video_data.begin() + 20, 90);
     std::fill(video_data.begin() + 20, video_data.end(), 160);
-    video_input->buffer = std::make_shared<SimpleBuffer>(std::move(video_data));
+    auto video_input_owner = std::make_shared<SimpleBuffer>(std::move(video_data));
+    const auto* video_bytes = video_input_owner->Data();
+    video_input->view = MediaBufferView::FromContiguous({
+        {video_bytes, 16, PlaneGeometry{4, 4, 4}},
+        {video_bytes + 16, 4, PlaneGeometry{2, 2, 2}},
+        {video_bytes + 20, 4, PlaneGeometry{2, 2, 2}},
+    }, ConstBufferRegion{video_bytes, video_input_owner->Size()}, video_input_owner);
 
     MediaFrameConverter video_converter;
     MediaFrameConverterConfig video_config{};
@@ -309,19 +310,19 @@ int RunFfmpegConverterTest() {
 
     const auto* converted_video_meta = video_output->VideoMeta();
     const auto* converted_video_buffer =
-        dynamic_cast<const FFmpegRawFrameBuffer*>(video_output->buffer.get());
+        static_cast<const AVFrame*>(video_output->view.Owner().get());
     const bool video_ok =
         video_output->type == MediaType::VIDEO &&
         converted_video_meta != nullptr &&
         converted_video_meta->width == 2 &&
         converted_video_meta->height == 2 &&
         converted_video_meta->pixel_format == PixelFormat::kNV12 &&
-        converted_video_meta->plane_count == 2 &&
+        video_output->PlaneCount() == 2 &&
         converted_video_buffer != nullptr &&
-        converted_video_buffer->GetFrame() ==
+        converted_video_buffer ==
             static_cast<const AVFrame*>(video_output->backend.ptr) &&
-        converted_video_buffer->PlaneData(0) != nullptr &&
-        converted_video_buffer->PlaneData(1) != nullptr &&
+        converted_video_buffer->extended_data[0] != nullptr &&
+        converted_video_buffer->extended_data[1] != nullptr &&
         video_output->backend.type == BackendHandle::FFMPEG &&
         video_output->backend.ptr != nullptr &&
         video_output->time.pts_us == video_input->time.pts_us;
@@ -351,8 +352,6 @@ int RunFfmpegConverterTest() {
     audio_meta.nb_samples = 160;
     audio_meta.bytes_per_sample = 2;
     audio_meta.planar = true;
-    audio_meta.plane_count = 1;
-    audio_meta.planes[0] = PlaneInfo{0, 320, 320};
     audio_input->meta = audio_meta;
 
     std::vector<uint8_t> audio_data(320, 0);
@@ -361,7 +360,11 @@ int RunFfmpegConverterTest() {
         // 使用递增波形即可，测试重点是格式转换链路，不是音频内容质量。
         audio_samples[i] = static_cast<int16_t>((i % 32) * 500);
     }
-    audio_input->buffer = std::make_shared<SimpleBuffer>(std::move(audio_data));
+    auto audio_input_owner = std::make_shared<SimpleBuffer>(std::move(audio_data));
+    const auto* audio_bytes = audio_input_owner->Data();
+    audio_input->view = MediaBufferView::FromContiguous({
+        {audio_bytes, 320, PlaneGeometry{320, 320, 1}},
+    }, ConstBufferRegion{audio_bytes, audio_input_owner->Size()}, audio_input_owner);
 
     MediaFrameConverter audio_converter;
     MediaFrameConverterConfig audio_config{};
@@ -385,7 +388,7 @@ int RunFfmpegConverterTest() {
 
     const auto* converted_audio_meta = audio_output->AudioMeta();
     const auto* converted_audio_buffer =
-        dynamic_cast<const FFmpegRawFrameBuffer*>(audio_output->buffer.get());
+        static_cast<const AVFrame*>(audio_output->view.Owner().get());
     // 8000Hz -> 16000Hz 后，样本数应大致翻倍；具体边界可能受 swr 延迟
     // 和重采样实现影响，所以这里只要求输出为正数，而不写死精确数量。
     const bool audio_ok =
@@ -397,9 +400,9 @@ int RunFfmpegConverterTest() {
         converted_audio_meta->nb_samples > 0 &&
         !converted_audio_meta->planar &&
         converted_audio_buffer != nullptr &&
-        converted_audio_buffer->GetFrame() ==
+        converted_audio_buffer ==
             static_cast<const AVFrame*>(audio_output->backend.ptr) &&
-        converted_audio_buffer->PlaneData(0) != nullptr &&
+        converted_audio_buffer->extended_data[0] != nullptr &&
         audio_output->backend.type == BackendHandle::FFMPEG &&
         audio_output->backend.ptr != nullptr &&
         audio_output->time.pts_us == audio_input->time.pts_us;

@@ -37,20 +37,22 @@ FramePtr MakeFrame(int index) {
     meta.pixel_format = PixelFormat::kI420;
     meta.width = kWidth;
     meta.height = kHeight;
-    meta.plane_count = 3;
-    meta.plane_info[0] = PlaneInfo{0, kWidth, kWidth * kHeight};
-    meta.plane_info[1] = PlaneInfo{kWidth * kHeight,
-                                   kWidth / 2,
-                                   kWidth * kHeight / 4};
-    meta.plane_info[2] = PlaneInfo{kWidth * kHeight * 5 / 4,
-                                   kWidth / 2,
-                                   kWidth * kHeight / 4};
     frame->meta = meta;
 
     std::vector<std::uint8_t> pixels(kWidth * kHeight * 3 / 2, 128);
     std::fill_n(pixels.begin(), kWidth * kHeight,
                 static_cast<std::uint8_t>(32 + index * 16));
-    frame->buffer = std::make_shared<SimpleBuffer>(std::move(pixels));
+    auto frame_owner = std::make_shared<SimpleBuffer>(std::move(pixels));
+    const auto* base = frame_owner->Data();
+    std::vector<MediaPlaneView> planes{
+        {base, kWidth * kHeight, PlaneGeometry{kWidth, kWidth, kHeight}},
+        {base + kWidth * kHeight, kWidth * kHeight / 4,
+            PlaneGeometry{kWidth / 2, kWidth / 2, kHeight / 2}},
+        {base + kWidth * kHeight * 5 / 4, kWidth * kHeight / 4,
+            PlaneGeometry{kWidth / 2, kWidth / 2, kHeight / 2}},
+    };
+    frame->view = MediaBufferView::FromContiguous(std::move(planes),
+        ConstBufferRegion{base, frame_owner->Size()}, frame_owner);
     return frame;
 }
 

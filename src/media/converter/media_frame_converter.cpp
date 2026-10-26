@@ -4,8 +4,8 @@
 #include "media/converter/ffmpeg_video_converter.h"
 #include "media/ffmpeg_frame_buffer.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
-#include "media/simple_buffer.h"
 #include "media/ffmpeg_format.h"
+#include "media/ffmpeg_frame_view.h"
 
 #include <chrono>
 #include <cstring>
@@ -67,23 +67,7 @@ const uint8_t* framePlane(const AVFrame& frame, int plane) {
     return plane < AV_NUM_DATA_POINTERS ? frame.data[plane] : nullptr;
 }
 
-/// @brief 验证 MediaFrame 缓冲区中的偏移量和大小是否合法
-bool isBufferRangeValid(const MediaFrame& frame, int32_t offset, int32_t size) {
-    if (!frame.buffer || offset < 0 || size < 0) {
-        return false;
-    }
-
-    const size_t start = static_cast<size_t>(offset);
-    const size_t length = static_cast<size_t>(size);
-    return start <= frame.buffer->Size() && length <= frame.buffer->Size() - start;
-}
-
-
 /// @brief 从 AVFrame 填充 MediaFrame 的类型和元数据，不复制平面数据。
-/// Raw AVFrame 的平面地址不一定能用 offset 表示，所以这里的 offset 仅
-/// 保留为 0；实际平面地址由 FFmpegRawFrameBuffer::PlaneData() 提供。
-/// 只要 MediaFrame.backend.type 为 FFMPEG，MediaFrameToAVFrame() 就会走
-/// av_frame_ref() 快速路径，不会根据这些 offset 重新读取 buffer。
 ///
 /// @param frame AVFrame 引用
 /// @param media_type 输出的媒体类型
@@ -95,7 +79,7 @@ bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& me
         const auto format = static_cast<AVPixelFormat>(frame.format);
         const PixelFormat pixel_format = FromAVPixelFormat(format);
         const int plane_count = av_pix_fmt_count_planes(format);
-        if (pixel_format == PixelFormat::kUnknown || !frame.data[0] || plane_count <= 0 || plane_count > 8) {
+        if (pixel_format == PixelFormat::kUnknown || !frame.data[0] || plane_count <= 0 || plane_count > 4) {
             error = "Unsupported or empty video AVFrame";
             return false;
         }
@@ -104,16 +88,6 @@ bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& me
         video.pixel_format = pixel_format;
         video.width = frame.width;
         video.height = frame.height;
-        video.plane_count = plane_count;
-
-        // 元数据中的 stride 仍然保留，便于知道每行在 AVFrame 中的布局。
-        // offset 对 raw buffer 没有意义，因此统一为 0。
-        for (int plane = 0; plane < plane_count; ++plane) {
-            const int stride = plane < AV_NUM_DATA_POINTERS ? frame.linesize[plane] : 0;
-            video.plane_info[plane].offset = 0;
-            video.plane_info[plane].stride = stride;
-            video.plane_info[plane].size = 0;
-        }
 
         media_type = MediaType::VIDEO;
         meta = video;
@@ -128,7 +102,7 @@ bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& me
         const bool planar = av_sample_fmt_is_planar(format) != 0;
         const int plane_count = planar ? channels : 1;
         if (sample_format == SampleFormat::Unknown || frame.sample_rate <= 0 ||
-            bytes_per_sample <= 0 || plane_count <= 0 || plane_count > 8 ||
+            bytes_per_sample <= 0 || plane_count <= 0 ||
             !frame.extended_data) {
             error = "Unsupported or empty audio AVFrame";
             return false;
@@ -143,24 +117,11 @@ bool FillRawFrameMeta(const AVFrame& frame, MediaType& media_type, FrameMeta& me
         audio.nb_samples = frame.nb_samples;
         audio.bytes_per_sample = bytes_per_sample;
         audio.planar = planar;
-        audio.plane_count = plane_count;
-
-        const size_t one_plane_size = static_cast<size_t>(frame.nb_samples) *
-                                      static_cast<size_t>(bytes_per_sample);
-        const size_t packed_plane_size = one_plane_size * static_cast<size_t>(channels);
-        const size_t max_int32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
-        if (one_plane_size > max_int32 || packed_plane_size > max_int32) {
-            error = "Audio AVFrame plane size exceeds MediaFrame metadata range";
-            return false;
-        }
         for (int plane = 0; plane < plane_count; ++plane) {
             if (!frame.extended_data[plane]) {
                 error = "Audio AVFrame plane is null";
                 return false;
             }
-            audio.planes[plane].offset = 0;
-            audio.planes[plane].stride = static_cast<int32_t>(planar ? one_plane_size : packed_plane_size);
-            audio.planes[plane].size = static_cast<int32_t>(planar ? one_plane_size : packed_plane_size);
         }
 
         media_type = MediaType::AUDIO;
@@ -334,7 +295,7 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
 
 #if !RAW_FRAME_BUFFER
     // 创建 MediaFrame 并将转换后的 AVFrame 转换为 MediaFrame
-    // 注意：MediaFrame.buffer 仍然负责保持原始 AVFrame 的生命周期，backend.ptr 只是指向该对象的非拥有指针。
+    // 注意：MediaFrame.view 仍然负责保持原始 AVFrame 的生命周期，backend.ptr 只是指向该对象的非拥有指针。
     output = std::make_shared<MediaFrame>();
     if (!AvFrameToMediaFrame(*converted, output.get())) {
         output.reset();
@@ -345,7 +306,7 @@ bool MediaFrameConverter::ffmpegVideoConvert(const MediaFrame& input,
     av_frame_free(&converted);
 #else
     // 转换器已经把数据写入 converted。这里直接把 AVFrame 交给输出
-    // MediaFrame，避免再次打包到 SimpleBuffer。
+    // MediaFrame，避免再次打包到 owned storage。
     if (!AdoptAVFrame(converted, output)) {
         return false;
     }
@@ -405,34 +366,41 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
         return false;
     }
 
-    // 这是 FFmpeg 后端的快速路径。MediaFrame.buffer 仍然负责保持原始
-    // AVFrame 的生命周期，backend.ptr 只是指向该对象的非拥有指针。
-    // av_frame_ref 会为 AVFrame 的引用计数数据增加一份引用；本函数释放
-    // 临时 source 时不会影响输入 MediaFrame 的数据。
-    if (input.backend.type == BackendHandle::FFMPEG && input.backend.ptr) {
+    if (input.backend.type == BackendHandle::FFMPEG && input.backend.ptr && input.view.Owner().get() == input.backend.ptr) {
         const auto* source = static_cast<const AVFrame*>(input.backend.ptr);
-        const auto* raw_buffer =
-            dynamic_cast<const FFmpegRawFrameBuffer*>(input.buffer.get());
-        const auto* packed_buffer =
-            dynamic_cast<const FFmpegFrameBuffer*>(input.buffer.get());
-        const bool backend_matches_buffer =
-            (raw_buffer && raw_buffer->GetFrame() == source) ||
-            (packed_buffer && packed_buffer->GetFrame() == source);
-        if (!backend_matches_buffer || (raw_buffer && !raw_buffer->IsValid())) {
-            last_error_ = "MediaFrame raw buffer and backend frame do not match";
-            return false;
+        bool matches_view = false;
+        if (input.view.PlaneCount() != 0) {
+            const auto original = MakeFFmpegFrameView(*source, input.view.Owner());
+            matches_view = original.PlaneCount() == input.view.PlaneCount();
+            if (const auto* video = input.VideoMeta()) {
+                matches_view = matches_view && video->width == source->width && video->height == source->height &&
+                    video->pixel_format == FromAVPixelFormat(static_cast<AVPixelFormat>(source->format));
+            } else if (const auto* audio = input.AudioMeta()) {
+                matches_view = matches_view && audio->nb_samples == source->nb_samples &&
+                    audio->sample_rate == source->sample_rate && audio->channels == source->ch_layout.nb_channels &&
+                    audio->sample_format == FromAVSampleFormat(static_cast<AVSampleFormat>(source->format));
+            }
+            for (size_t p = 0; matches_view && p < original.PlaneCount(); ++p) {
+                const auto& expected = *original.Plane(p);
+                const auto& actual = *input.view.Plane(p);
+                matches_view = actual.IsValid() && actual.data == expected.data && actual.size == expected.size &&
+                    actual.geometry.stride == expected.geometry.stride && actual.geometry.rows == expected.geometry.rows &&
+                    actual.geometry.row_bytes == expected.geometry.row_bytes;
+            }
         }
-        av_frame_unref(av_frame);
-        const int ret = av_frame_ref(av_frame, source);
-        if (ret < 0) {
-            last_error_ = "av_frame_ref failed: " + AvErrorString(ret);
-            return false;
+        if (matches_view) {
+            av_frame_unref(av_frame);
+            const int ret = av_frame_ref(av_frame, source);
+            if (ret < 0) {
+                last_error_ = "av_frame_ref failed: " + AvErrorString(ret);
+                return false;
+            }
+            SetAVFrameTime(input, av_frame);
+            return true;
         }
-        SetAVFrameTime(input, av_frame);
-        return true;
     }
 
-    if (!input.buffer || !input.buffer->Data() || input.buffer->Size() == 0) {
+    if (input.view.PlaneCount() == 0) {
         last_error_ = "Input MediaFrame buffer is empty";
         return false;
     }
@@ -453,7 +421,7 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
 
         const int plane_count = av_pix_fmt_count_planes(format);
         if (plane_count <= 0 || plane_count > 4 ||
-            meta->plane_count < plane_count) {
+            input.view.PlaneCount() != static_cast<std::size_t>(plane_count)) {
             last_error_ = "Unsupported or incomplete video plane metadata";
             return false;
         }
@@ -471,18 +439,25 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
 
         const uint8_t* source_data[4]{};
         int source_linesize[4]{};
+        int expected_row_bytes[4]{};
+        ptrdiff_t compact_strides[4]{};
+        size_t compact_sizes[4]{};
+        if (av_image_fill_linesizes(expected_row_bytes, format, meta->width) < 0) return false;
+        for (int p = 0; p < 4; ++p) compact_strides[p] = expected_row_bytes[p];
+        if (av_image_fill_plane_sizes(compact_sizes, format, meta->height, compact_strides) < 0) return false;
         for (int plane = 0; plane < plane_count; ++plane) {
-            const PlaneInfo& plane_info = meta->plane_info[plane];
-            if (plane_info.stride <= 0 || plane_info.size <= 0 ||
-                !isBufferRangeValid(input,
-                                    plane_info.offset,
-                                    plane_info.size)) {
-                last_error_ = "Invalid video plane range";
+            const auto slice = input.PlaneView(plane);
+            const auto expected_rows = compact_sizes[plane] / static_cast<size_t>(expected_row_bytes[plane]);
+            const auto stride_magnitude = slice.geometry.stride < 0 ? static_cast<std::size_t>(-(slice.geometry.stride + 1)) + 1 : static_cast<std::size_t>(slice.geometry.stride);
+            if (!slice.data || slice.geometry.stride < std::numeric_limits<int>::min() ||
+                slice.geometry.stride > std::numeric_limits<int>::max() || slice.geometry.row_bytes < expected_row_bytes[plane] || static_cast<size_t>(slice.geometry.rows) < expected_rows ||
+                stride_magnitude < expected_row_bytes[plane]) {
+                last_error_ = "Invalid video plane view";
                 av_frame_unref(av_frame);
                 return false;
             }
-            source_data[plane] = input.buffer->Data() + plane_info.offset;
-            source_linesize[plane] = plane_info.stride;
+            source_data[plane] = slice.data;
+            source_linesize[plane] = slice.geometry.stride;
         }
 
         av_image_copy(av_frame->data,
@@ -521,8 +496,8 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
         const bool planar = av_sample_fmt_is_planar(format) != 0;
         const int plane_count = planar ? meta->channels : 1;
         const int bytes_per_sample = av_get_bytes_per_sample(format);
-        if (bytes_per_sample <= 0 || plane_count <= 0 || plane_count > 8 ||
-            meta->plane_count < plane_count) {
+        if (bytes_per_sample <= 0 || plane_count <= 0 ||
+            input.view.PlaneCount() != static_cast<std::size_t>(plane_count)) {
             last_error_ = "Invalid audio plane metadata";
             return false;
         }
@@ -547,32 +522,30 @@ bool MediaFrameConverter::MediaFrameToAVFrame(const MediaFrame& input, AVFrame* 
 
         const size_t one_plane_size = static_cast<size_t>(meta->nb_samples) *
                                       static_cast<size_t>(bytes_per_sample);
+        if (one_plane_size > std::numeric_limits<size_t>::max() /
+                static_cast<size_t>(meta->channels)) {
+            last_error_ = "Audio plane size overflow";
+            av_frame_unref(av_frame);
+            return false;
+        }
         const size_t packed_size = one_plane_size *
                                    static_cast<size_t>(meta->channels);
         for (int plane = 0; plane < plane_count; ++plane) {
-            const PlaneInfo& plane_info = meta->planes[plane];
             const size_t required_size = planar ? one_plane_size : packed_size;
-            if (plane_info.size < 0 ||
-                static_cast<size_t>(plane_info.size) < required_size ||
-                !isBufferRangeValid(input,
-                                    plane_info.offset,
-                                    plane_info.size)) {
+            const auto* source = input.view.Plane(static_cast<std::size_t>(plane));
+            if (!source || !source->IsValid() || source->geometry.rows != 1 ||
+                source->geometry.row_bytes < required_size) {
                 last_error_ = "Invalid audio plane range";
                 av_frame_unref(av_frame);
                 return false;
             }
-
-            uint8_t* destination = planar
-                ? av_frame->extended_data[plane]
-                : av_frame->extended_data[0];
+            uint8_t* destination = av_frame->extended_data[plane];
             if (!destination) {
                 last_error_ = "Audio AVFrame plane is null";
                 av_frame_unref(av_frame);
                 return false;
             }
-            std::memcpy(destination,
-                        input.buffer->Data() + plane_info.offset,
-                        required_size);
+            std::memcpy(destination, source->data, required_size);
         }
 
         SetAVFrameTime(input, av_frame);
@@ -588,7 +561,7 @@ bool MediaFrameConverter::AvFrameToMediaFrame(const AVFrame& av_frame, MediaFram
         last_error_ = "Output MediaFrame is null";
         return false;
     }
-    // 后面是将avframe中的数据复制到 SimpleBuffer 中，所有权为 MediaFrame
+    // 后面是将avframe中的数据复制到 owned storage 中，所有权为 MediaFrame
     *media_frame = MediaFrame{};
     media_frame->backend = {};
     SetMediaFrameTime(av_frame, media_frame);
@@ -652,24 +625,22 @@ bool MediaFrameConverter::AvFrameToMediaFrame(const AVFrame& av_frame, MediaFram
         meta.pixel_format = pixel_format;
         meta.width = av_frame.width;
         meta.height = av_frame.height;
-        meta.plane_count = plane_count;
-
-        size_t offset = 0;
-        for (int plane = 0; plane < plane_count; ++plane) {
-            if (plane_sizes[plane] > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-                offset > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-                last_error_ = "Video plane metadata exceeds int32 range";
-                return false;
-            }
-            meta.plane_info[plane].offset = static_cast<int32_t>(offset);
-            meta.plane_info[plane].stride = packed_linesize[plane];
-            meta.plane_info[plane].size = static_cast<int32_t>(plane_sizes[plane]);
-            offset += plane_sizes[plane];
-        }
 
         media_frame->type = MediaType::VIDEO;
         media_frame->meta = meta;
-        media_frame->buffer = std::make_shared<SimpleBuffer>(std::move(packed));
+        auto owner = std::make_shared<std::vector<uint8_t>>(std::move(packed));
+        std::vector<MediaPlaneView> views;
+        views.reserve(static_cast<std::size_t>(plane_count));
+        size_t offset = 0;
+        for (int p = 0; p < plane_count; ++p) {
+            views.emplace_back(owner->data() + offset, plane_sizes[p],
+                PlaneGeometry{packed_linesize[p], static_cast<size_t>(packed_linesize[p]),
+                    plane_sizes[p] / static_cast<size_t>(packed_linesize[p])});
+            offset += plane_sizes[p];
+        }
+        media_frame->view = MediaBufferView::FromContiguous(std::move(views),
+            ConstBufferRegion{owner->data(), static_cast<size_t>(total_size)},
+            owner);
         last_error_.clear();
         return true;
     }
@@ -689,15 +660,18 @@ bool MediaFrameConverter::AvFrameToMediaFrame(const AVFrame& av_frame, MediaFram
         const int plane_count = planar ? channels : 1;
         const size_t one_plane_size = static_cast<size_t>(av_frame.nb_samples) *
                                       static_cast<size_t>(bytes_per_sample);
+        if (channels <= 0 || one_plane_size >
+                std::numeric_limits<size_t>::max() / static_cast<size_t>(channels)) {
+            last_error_ = "Invalid audio buffer size";
+            return false;
+        }
+        const size_t packed_size = one_plane_size * static_cast<size_t>(channels);
         // planar：每个声道一个平面，每个平面包含 nb_samples 个样本。
         // packed：所有声道交错存放在同一个平面，所以同一个平面要包含
         // nb_samples * channels 个样本。两种布局的总字节数实际都等于：
         // nb_samples * bytes_per_sample * channels。
-        const size_t total_size = one_plane_size *
-                                  static_cast<size_t>(channels);
-        if (total_size == 0 ||
-            total_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-            plane_count <= 0 || plane_count > 8) {
+        const size_t total_size = packed_size;
+        if (total_size == 0 || plane_count <= 0) {
             last_error_ = "Invalid audio buffer size";
             return false;
         }
@@ -731,23 +705,21 @@ bool MediaFrameConverter::AvFrameToMediaFrame(const AVFrame& av_frame, MediaFram
         meta.nb_samples = av_frame.nb_samples;
         meta.bytes_per_sample = bytes_per_sample;
         meta.planar = planar;
-        meta.plane_count = plane_count;
-
-        for (int plane = 0; plane < plane_count; ++plane) {
-            const size_t offset = planar
-                ? static_cast<size_t>(plane) * one_plane_size
-                : 0;
-            const size_t plane_size = planar
-                ? one_plane_size
-                : one_plane_size * static_cast<size_t>(channels);
-            meta.planes[plane].offset = static_cast<int32_t>(offset);
-            meta.planes[plane].stride = static_cast<int32_t>(plane_size);
-            meta.planes[plane].size = static_cast<int32_t>(plane_size);
-        }
 
         media_frame->type = MediaType::AUDIO;
         media_frame->meta = meta;
-        media_frame->buffer = std::make_shared<SimpleBuffer>(std::move(packed));
+        auto owner = std::make_shared<std::vector<uint8_t>>(std::move(packed));
+        std::vector<MediaPlaneView> views;
+        views.reserve(static_cast<std::size_t>(plane_count));
+        size_t offset = 0;
+        for (int p = 0; p < plane_count; ++p) {
+            const auto size = planar ? one_plane_size : packed_size;
+            views.emplace_back(owner->data() + offset, size,
+                PlaneGeometry{static_cast<ptrdiff_t>(size), size, 1});
+            offset += size;
+        }
+        media_frame->view = MediaBufferView::FromContiguous(std::move(views),
+            ConstBufferRegion{owner->data(), total_size}, owner);
         last_error_.clear();
         return true;
     }
@@ -802,7 +774,12 @@ bool MediaFrameConverter::AdoptAVFrame(AVFrame* av_frame, std::shared_ptr<MediaF
     MediaFrame result;
     result.type = media_type;
     result.meta = std::move(meta);
-    result.buffer = raw_buffer;
+    result.view = MakeFFmpegFrameView(*raw_buffer->GetFrame(),
+        std::shared_ptr<const AVFrame>(raw_buffer, raw_buffer->GetFrame()));
+    if (result.view.PlaneCount() == 0) {
+        last_error_ = "Invalid raw AVFrame layout";
+        return false;
+    }
     result.backend.type = BackendHandle::FFMPEG;
     result.backend.ptr = raw_buffer->GetFrame();
     SetMediaFrameTime(*raw_buffer->GetFrame(), &result);

@@ -2,6 +2,7 @@
 #include "media/ffmpeg_frame_buffer.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
 #include "media/ffmpeg_format.h"
+#include "media/ffmpeg_frame_view.h"
 #include "common/log/logger.h"
 
 #include <cstddef>
@@ -405,7 +406,7 @@ bool FFmpegDecoder::receiveFrames() {
         mf->time.pts_us = TimestampToUs(FramePts(decoded_frame), frame_time_base);
         mf->time.dts_us = TimestampToUs(decoded_frame->pkt_dts, frame_time_base);
         mf->time.duration_us = TimestampToUs(decoded_frame->duration, frame_time_base);
-        mf->buffer = fb;
+        mf->view = MakeFFmpegFrameView(*decoded_frame, std::shared_ptr<const AVFrame>(fb, decoded_frame));
         mf->backend.type = BackendHandle::FFMPEG;
         mf->backend.ptr = fb->GetFrame();
 
@@ -416,37 +417,6 @@ bool FFmpegDecoder::receiveFrames() {
             video_meta.pixel_format = FromAVPixelFormat(av_pix_fmt);
             video_meta.width = fb->GetFrame()->width;
             video_meta.height = fb->GetFrame()->height;
-            video_meta.plane_count = fb->GetFrame()->format >= 0 ?
-                av_pix_fmt_count_planes(av_pix_fmt) : 0;
-            // 计算每条线的字节数
-            int packed_linesizes[4] = {};
-            ptrdiff_t packed_linesizes_ptrdiff[4] = {};
-            size_t packed_plane_sizes[4] = {};
-            // av_image_fill_linesizes 计算每个平面的 linesize
-            if (video_meta.plane_count > 0 &&
-                av_image_fill_linesizes(packed_linesizes, av_pix_fmt, video_meta.width) >= 0) {
-                for (int i = 0; i < 4; ++i) {
-                    packed_linesizes_ptrdiff[i] = packed_linesizes[i];
-                }
-                // av_image_fill_plane_sizes 计算每个平面的总字节数
-                (void)av_image_fill_plane_sizes(
-                    packed_plane_sizes,
-                    av_pix_fmt,
-                    video_meta.height,
-                    packed_linesizes_ptrdiff);
-            }
-
-            // 填充平面信息
-            size_t plane_offset = 0;
-            for (int i = 0; i < video_meta.plane_count && i < 8; ++i) {
-                const size_t plane_size = i < 4 ? packed_plane_sizes[i] : 0;
-                // 计算每个平面的偏移量
-                video_meta.plane_info[i].offset = static_cast<int32_t>(plane_offset);
-                // 计算每个平面的步长
-                video_meta.plane_info[i].stride = i < 4 ? packed_linesizes[i] : 0;
-                video_meta.plane_info[i].size = static_cast<int32_t>(plane_size);
-                plane_offset += plane_size;
-            }
             mf->meta = video_meta;
         }
         else if (stream_info_.media_type == MediaType::AUDIO) {
@@ -460,27 +430,6 @@ bool FFmpegDecoder::receiveFrames() {
             audio_meta.nb_samples = fb->GetFrame()->nb_samples;
             audio_meta.bytes_per_sample = av_get_bytes_per_sample(av_sample_fmt);
             audio_meta.planar = av_sample_fmt_is_planar(av_sample_fmt) != 0;
-            audio_meta.plane_count = audio_meta.planar ? fb->GetFrame()->ch_layout.nb_channels : 1;
-
-            const size_t samples = audio_meta.nb_samples > 0
-                ? static_cast<size_t>(audio_meta.nb_samples)
-                : size_t{ 0 };
-            const size_t bytes_per_sample = audio_meta.bytes_per_sample > 0
-                ? static_cast<size_t>(audio_meta.bytes_per_sample)
-                : size_t{ 0 };
-            const size_t channels = audio_meta.channels > 0
-                ? static_cast<size_t>(audio_meta.channels)
-                : size_t{ 0 };
-            const size_t planar_plane_size = samples * bytes_per_sample;
-            const size_t packed_plane_size = planar_plane_size * channels;
-
-            for (int i = 0; i < audio_meta.plane_count && i < 8; ++i) {
-                const size_t plane_size = audio_meta.planar ? planar_plane_size : packed_plane_size;
-                audio_meta.planes[i].offset = static_cast<int32_t>(
-                    audio_meta.planar ? static_cast<size_t>(i) * planar_plane_size : 0);
-                audio_meta.planes[i].stride = static_cast<int32_t>(plane_size);
-                audio_meta.planes[i].size = static_cast<int32_t>(plane_size);
-            }
             mf->meta = audio_meta;
         }
 
@@ -571,7 +520,7 @@ bool FFmpegDecoder::receiveFrames() {
         mf->time.pts_us = TimestampToUs(FramePts(decoded_frame), frame_time_base);
         mf->time.dts_us = TimestampToUs(decoded_frame->pkt_dts, frame_time_base);
         mf->time.duration_us = TimestampToUs(decoded_frame->duration, frame_time_base);
-        mf->buffer = fb;
+        mf->view = MakeFFmpegFrameView(*decoded_frame, std::shared_ptr<const AVFrame>(fb, decoded_frame));
         mf->backend.type = BackendHandle::FFMPEG;
         mf->backend.ptr = fb->GetFrame();
 
@@ -582,22 +531,6 @@ bool FFmpegDecoder::receiveFrames() {
             video_meta.pixel_format = FromAVPixelFormat(av_pix_fmt);
             video_meta.width = fb->GetFrame()->width;
             video_meta.height = fb->GetFrame()->height;
-            video_meta.plane_count = fb->GetFrame()->format >= 0 ?
-                av_pix_fmt_count_planes(av_pix_fmt) : 0;
-            // raw AVFrame 的平面地址由 FFmpegRawFrameBuffer::PlaneData() 提供，
-            // 所以 plane_info.offset 不再表示连续 buffer 中的偏移，统一设为 0。
-            // stride/size 仍记录真实 AVFrame 布局，供只读取元数据的模块使用。
-            // 填充 raw 平面信息。不要依据 offset 对 buffer->Data() 做地址计算；
-            // FFmpegRawFrameBuffer 不是连续 buffer，Data() 会返回 nullptr。
-            for (int i = 0; i < video_meta.plane_count && i < 8; ++i) {
-                const size_t plane_size = fb->PlaneSize(i);
-                video_meta.plane_info[i].offset = 0;
-                video_meta.plane_info[i].stride = fb->PlaneStride(i);
-                video_meta.plane_info[i].size = plane_size <=
-                    static_cast<size_t>(std::numeric_limits<int32_t>::max())
-                    ? static_cast<int32_t>(plane_size)
-                    : 0;
-            }
             mf->meta = video_meta;
         }
         else if (stream_info_.media_type == MediaType::AUDIO) {
@@ -611,29 +544,6 @@ bool FFmpegDecoder::receiveFrames() {
             audio_meta.nb_samples = fb->GetFrame()->nb_samples;
             audio_meta.bytes_per_sample = av_get_bytes_per_sample(av_sample_fmt);
             audio_meta.planar = av_sample_fmt_is_planar(av_sample_fmt) != 0;
-            audio_meta.plane_count = audio_meta.planar ? fb->GetFrame()->ch_layout.nb_channels : 1;
-
-            const size_t samples = audio_meta.nb_samples > 0
-                ? static_cast<size_t>(audio_meta.nb_samples)
-                : size_t{ 0 };
-            const size_t bytes_per_sample = audio_meta.bytes_per_sample > 0
-                ? static_cast<size_t>(audio_meta.bytes_per_sample)
-                : size_t{ 0 };
-            const size_t channels = audio_meta.channels > 0
-                ? static_cast<size_t>(audio_meta.channels)
-                : size_t{ 0 };
-            const size_t planar_plane_size = samples * bytes_per_sample;
-            const size_t packed_plane_size = planar_plane_size * channels;
-
-            for (int i = 0; i < audio_meta.plane_count && i < 8; ++i) {
-                const size_t plane_size = audio_meta.planar ? planar_plane_size : packed_plane_size;
-                // 音频 raw 平面同样不构成一个连续 buffer。每个平面的地址必须
-                // 经由 FFmpegRawFrameBuffer::PlaneData() 或 AVFrame::extended_data
-                // 取得，所以 offset 始终为 0。
-                audio_meta.planes[i].offset = 0;
-                audio_meta.planes[i].stride = static_cast<int32_t>(plane_size);
-                audio_meta.planes[i].size = static_cast<int32_t>(plane_size);
-            }
             mf->meta = audio_meta;
         }
 

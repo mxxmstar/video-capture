@@ -128,7 +128,7 @@ public:
     /// @param av_frame 输入AVFrame
     /// @param media_frame 输出媒体帧
     /// @return 是否成功构建媒体帧
-    /// @note 该接口不接管 av_frame，输出使用独立的 SimpleBuffer。
+    /// @note 该接口不接管 av_frame，输出使用独立的 MediaBufferView。
     static bool AvFrameToMediaFrame(const AVFrame& av_frame, MediaFrame* media_frame);
 
     /// @brief 设置 AVFrame 时间戳

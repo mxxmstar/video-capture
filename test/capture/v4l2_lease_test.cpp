@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#include "common/log/log.h"
 namespace {
 void Require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
@@ -27,7 +26,16 @@ std::shared_ptr<MediaFrame> Read(V4L2VideoCapture& capture) {
     throw std::runtime_error("Frame deadline exceeded");
 }
 std::vector<uint8_t> Bytes(const MediaFrame& frame) {
-    return {frame.buffer->Data(), frame.buffer->Data() + frame.buffer->Size()};
+    std::vector<uint8_t> bytes;
+    for (int p = 0; p < frame.PlaneCount(); ++p) {
+        const auto plane = frame.PlaneView(p);
+        Require(plane.data != nullptr, "Invalid leased plane view");
+        for (int row = 0; row < plane.geometry.rows; ++row) {
+            const auto* data = plane.data + static_cast<std::ptrdiff_t>(row) * plane.geometry.stride;
+            bytes.insert(bytes.end(), data, data + plane.geometry.row_bytes);
+        }
+    }
+    return bytes;
 }
 std::size_t DescriptorCount() {
     std::size_t count = 0;
@@ -71,18 +79,14 @@ int main(int argc, char** argv) {
             held.push_back(Read(capture));
 
         // 验证 MmapLease 模式下返回的是 FrameLease（零拷贝引用 mmap 内存）
-        auto lease = std::dynamic_pointer_cast<FrameLease>(held.front()->buffer);
-        Require(lease != nullptr, "MmapLease mode did not return a lease");
-
-        // 记录当前队列的 generation，用于后续验证 reopen 后 generation 递增
-        const auto generation = lease->Generation();
-        LOG_INFO("Initial generation: {}", generation);
-        lease.reset();
+        Require(held.front()->view.PlaneCount() > 0,
+                "MmapLease mode did not return a view-only frame");
+        const auto* retained_mapping = held.front()->PlaneView(0).data;
 
         const auto saved = Bytes(*held.front());              // 保存第一帧的校验数据
 
         // 构造两个消费者引用同一个 buffer（后一帧的 buffer，会被 moved out）
-        auto second_consumer = held.back()->buffer;           // 消费者 A：保留引用
+        auto second_consumer = held.back()->view;           // 消费者 A：保留引用
         auto released = std::move(held.back());               // 消费者 B：取出独占所有权
         held.pop_back();
 
@@ -99,7 +103,7 @@ int main(int argc, char** argv) {
 
         // 释放消费者 A：最后一个消费者释放后，slot → RecyclePending → DrainReturns → QBUF → 采集线程被唤醒
         auto release_last = std::async(std::launch::async,
-            [buffer = std::move(second_consumer)]() mutable { buffer.reset(); });
+            [view = std::move(second_consumer)]() mutable { view = {}; });
         release_last.get();
         Require(pending.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
                 "Cross-thread release did not wake exhausted capture queue");
@@ -129,9 +133,9 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 5; ++i) {
             Open(capture);
             auto current = Read(capture);
-            auto current_lease = std::dynamic_pointer_cast<FrameLease>(current->buffer);
-            // 新打开的队列 generation 必须大于旧队列，防止旧 FrameLease 误操作新队列的 slot
-            Require(current_lease && current_lease->Generation() > generation, "Reused queue generation");
+            Require(current->PlaneView(0).data != nullptr, "Reopened capture returned no plane");
+            if (!held.empty()) Require(current->PlaneView(0).data != retained_mapping,
+                                      "Reopen reused a retained mapping");
             if (!held.empty()) {
                 // 旧代 held 的映射在 reopen 后依然有效，内容不受新采集影响
                 Require(Bytes(*held.front()) == saved, "Reopen overwrote old generation");
@@ -164,8 +168,9 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < copying.GetVideoInfo().buffer_count + 3; ++i)
             copies.push_back(Read(copying));
         // Copy 模式下 buffer 不是 FrameLease，而是独立的内存拷贝
-        Require(!std::dynamic_pointer_cast<FrameLease>(copies.front()->buffer),
-                "Copy mode retained driver lease");
+        Require(copies.front()->view.PlaneCount() > 0 &&
+                copies.front()->Stride(0) == copies.front()->PlaneView(0).geometry.row_bytes,
+                "Copy mode did not return compact plane views");
         const auto copy_bytes = Bytes(*copies.front());
         copying.Close();
         // Copy 模式的数据在 Close 后仍有效（已从驱动内存中深拷贝出来）

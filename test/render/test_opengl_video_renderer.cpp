@@ -1,6 +1,7 @@
 #include "render/video/opengl_video_renderer.h"
 #include "media/simple_buffer.h"
 #include "media/ffmpeg_raw_frame_buffer.h"
+#include "media/ffmpeg_frame_view.h"
 
 #include <glad/glad.h>
 #include <array>
@@ -82,14 +83,10 @@ MediaFrame MakeFrame(PixelFormat format) {
     const bool rgb = format == PixelFormat::kRGB24 || format == PixelFormat::kBGR24;
     const bool gray = format == PixelFormat::kGRAY8;
     const bool planar = format == PixelFormat::kI420;
-    meta.plane_count = rgb || gray ? 1 : (planar ? 3 : 2);
-    meta.plane_info[0] = {5, rgb ? 11 : 5, 0};
-    meta.plane_info[1] = {24, planar ? 3 : 5, 0};
-    meta.plane_info[2] = {33, 3, 0};
     std::vector<std::uint8_t> bytes(48, 0);
     for (int y = 0; y < 3; ++y) {
         for (int x = 0; x < 3; ++x) {
-            auto* pixel = bytes.data() + 5 + y * meta.plane_info[0].stride + x * (rgb ? 3 : 1);
+            auto* pixel = bytes.data() + 5 + y * (rgb ? 11 : 5) + x * (rgb ? 3 : 1);
             if (rgb) pixel[format == PixelFormat::kRGB24 ? 0 : 2] = 255;
             else pixel[0] = gray ? 128 : 81;
         }
@@ -109,7 +106,23 @@ MediaFrame MakeFrame(PixelFormat format) {
         }
     }
     frame.meta = meta;
-    frame.buffer = std::make_shared<SimpleBuffer>(std::move(bytes));
+    auto frame_owner = std::make_shared<SimpleBuffer>(std::move(bytes));
+    const auto* base = frame_owner->Data();
+    std::vector<MediaPlaneView> planes;
+    if (rgb) {
+        planes.emplace_back(base + 5, 31, PlaneGeometry{11, 9, 3});
+    } else if (gray) {
+        planes.emplace_back(base + 5, 13, PlaneGeometry{5, 3, 3});
+    } else if (planar) {
+        planes.emplace_back(base + 5, 13, PlaneGeometry{5, 3, 3});
+        planes.emplace_back(base + 24, 5, PlaneGeometry{3, 2, 2});
+        planes.emplace_back(base + 33, 5, PlaneGeometry{3, 2, 2});
+    } else {
+        planes.emplace_back(base + 5, 13, PlaneGeometry{5, 3, 3});
+        planes.emplace_back(base + 24, 9, PlaneGeometry{5, 4, 2});
+    }
+    frame.view = MediaBufferView::FromContiguous(std::move(planes),
+        ConstBufferRegion{base, frame_owner->Size()}, frame_owner);
     return frame;
 }
 
@@ -333,19 +346,24 @@ int main() {
     MediaFrame raw_frame;
     VideoFrameMeta meta;
     meta.width = raw->width; meta.height = raw->height;
-    meta.pixel_format = PixelFormat::kRGB24; meta.plane_count = 1;
+    meta.pixel_format = PixelFormat::kRGB24;
     raw_frame.meta = meta;
-    raw_frame.buffer = std::make_shared<FFmpegRawFrameBuffer>(raw);
+    auto raw_frame_owner = std::make_shared<FFmpegRawFrameBuffer>(raw);
+    raw_frame.view = Media::MakeFFmpegFrameView(*raw, std::shared_ptr<const AVFrame>(raw_frame_owner, raw));
     if (!CheckPixel(renderer, raw_frame, {0, 255, 0})) return 1;
     raw->data[0] += (raw->height - 1) * raw->linesize[0];
     raw->linesize[0] = -raw->linesize[0];
+    raw_frame.view = Media::MakeFFmpegFrameView(*raw, std::shared_ptr<const AVFrame>(raw_frame_owner, raw));
     if (!CheckPixel(renderer, raw_frame, {0, 255, 0})) return 1;
 
     auto invalid = MakeFrame(PixelFormat::kRGB24);
-    invalid.buffer = std::make_shared<SimpleBuffer>();
+    auto invalid_owner = std::make_shared<SimpleBuffer>();
+    invalid.view = {};
     if (!Check(!renderer.Render(invalid), "empty buffer accepted")) return 1;
     invalid = MakeFrame(PixelFormat::kRGB24);
-    std::get<VideoFrameMeta>(invalid.meta).plane_count = 9;
+    const auto* first_plane = invalid.view.Plane(0);
+    std::vector<MediaPlaneView> too_many_planes(9, *first_plane);
+    invalid.view = MediaBufferView(std::move(too_many_planes), invalid.view.Owner());
     if (!Check(!renderer.Render(invalid), "invalid plane count accepted")) return 1;
     invalid.type = MediaType::AUDIO;
     if (!Check(!renderer.Render(invalid), "audio frame accepted")) return 1;

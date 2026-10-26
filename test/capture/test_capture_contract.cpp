@@ -55,19 +55,18 @@ void TestLayout(PixelFormat format) {
     const auto frame = MediaFrame::CreateCompact(source.data(), source.size(),
                                       info.pixel_format, 4, info.height,
                                       source_stride);
-    const auto* meta = frame->VideoMeta();
-    Require(frame->buffer->Size() == (format == PixelFormat::kYUYV422 ? 16U : 12U), "Packed size");
+    Require(frame->view.TotalSize() == (format == PixelFormat::kYUYV422 ? 16U : 12U), "Packed size");
     Require(frame->Stride(0) == (format == PixelFormat::kYUYV422 ? 8 : 4), "Packed stride");
-    Require(frame->buffer->Data()[frame->Stride(0)] == source[source_stride], "Padding was copied as pixels");
+    Require(frame->view.Data(0)[frame->Stride(0)] == source[source_stride], "Padding was copied as pixels");
     if (format != PixelFormat::kYUYV422) {
-        Require(frame->buffer->Data()[meta->plane_info[1].offset] == source[16], "UV offset");
+        Require(frame->view.Data(1)[0] == source[16], "UV offset");
         if (format == PixelFormat::kI420) {
-            Require(frame->buffer->Data()[meta->plane_info[2].offset] == source[20], "V offset");
+            Require(frame->view.Data(2)[0] == source[20], "V offset");
         }
     }
-    const auto original = frame->buffer->Data()[0];
+    const auto original = frame->view.Data(0)[0];
     source[0] = 255;
-    Require(frame->buffer->Data()[0] == original, "Frame borrows source storage");
+    Require(frame->view.Data(0)[0] == original, "Frame borrows source storage");
     Require(!MediaFrame::CreateCompact(source.data(), 1, info.pixel_format, 4,
         info.height, source_stride), "Truncated frame accepted");
 }

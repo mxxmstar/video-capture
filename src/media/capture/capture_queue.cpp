@@ -74,6 +74,7 @@ int CaptureQueue::Initialize(unsigned count, unsigned minimum_size, std::vector<
         }
 
         if (is_mplane) {
+            if (buffer.length == 0 || buffer.length > VIDEO_MAX_PLANES || buffer.length != plane_geometry_.size()) return EPROTO;
             std::size_t total_length = 0;
             for (unsigned plane_index = 0; plane_index < buffer.length; ++plane_index) {
                 total_length += planes[plane_index].length;
@@ -136,18 +137,22 @@ int CaptureQueue::Dequeue(v4l2_buffer& buffer, std::shared_ptr<FrameLease>& leas
     std::size_t buf_bytesused = 0;
     std::vector<MediaPlaneView> views;
     if (is_mplane) {
+        if (buffer.length == 0 || buffer.length > VIDEO_MAX_PLANES || buffer.length != frame_mapping.size() || buffer.length != plane_geometry_.size()) {
+            slots_[buffer.index] = SlotState::RecyclePending;
+            return EPROTO;
+        }
         for (unsigned plane_index = 0; plane_index < buffer.length; ++plane_index) {
-            if (planes[plane_index].bytesused > frame_mapping[plane_index].length) {
+            if (planes[plane_index].data_offset > planes[plane_index].bytesused || planes[plane_index].bytesused > frame_mapping[plane_index].length) {
                 LOG_ERROR("Plane {} bytesused {} exceeds mapped length {}", plane_index, planes[plane_index].bytesused, frame_mapping[plane_index].length);
                 slots_[buffer.index] = SlotState::RecyclePending;
                 return EPROTO;
             }
             const auto& geo = plane_geometry_[plane_index];
             views.push_back(MediaPlaneView{
-                static_cast<uint8_t*>(frame_mapping[plane_index].address),
-                planes[plane_index].bytesused,
+                static_cast<uint8_t*>(frame_mapping[plane_index].address) + planes[plane_index].data_offset,
+                planes[plane_index].bytesused - planes[plane_index].data_offset,
                 geo});
-            buf_bytesused += planes[plane_index].bytesused;
+            buf_bytesused += planes[plane_index].bytesused - planes[plane_index].data_offset;
         }
     } else {
         buf_bytesused = buffer.bytesused;
@@ -217,6 +222,7 @@ int CaptureQueue::DrainReturns() {
         }
         
         const auto& frame_planes = storage_->At(index);
+        std::array<v4l2_plane, VIDEO_MAX_PLANES> planes{};
         v4l2_buffer buffer{};
         buffer.type = buffer_type_;
         buffer.memory   = V4L2_MEMORY_MMAP;
@@ -224,7 +230,6 @@ int CaptureQueue::DrainReturns() {
         if (is_mplane) {
             uint32_t plane_count = static_cast<uint32_t>(frame_planes.size());
             buffer.length = plane_count;
-            std::array<v4l2_plane, VIDEO_MAX_PLANES> planes{};
             for (unsigned plane_index = 0; plane_index < plane_count; ++plane_index) {
                 planes[plane_index].length = static_cast<__u32>(frame_planes[plane_index].length);
                 planes[plane_index].m.mem_offset = frame_planes[plane_index].offset;

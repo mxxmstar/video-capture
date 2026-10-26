@@ -4,9 +4,9 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
-#include "media/ffmpeg_raw_frame_buffer.h"
 #include <iostream>
 #include <utility>
+#include <cassert>
 
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
@@ -389,69 +389,34 @@ struct UploadPlaneView {
 /// @brief 从媒体帧中解析指定平面数据和步长，上传到平面视图中
 /// @param frame 输入媒体帧
 /// @param plane 平面索引
-/// @param fallback_offset 回退偏移量
-/// @param row_bytes 每行字节数
-/// @param rows 行数
+/// @param row_bytes 调用者期望的每行字节数
+/// @param rows 调用者期望的行数
 /// @param out 输出平面视图
 /// @param error 输出错误信息
 /// @return 是否成功解析
 bool ResolveUploadPlane(const MediaFrame& frame,
                         int plane,
-                        std::size_t fallback_offset,
                         int row_bytes,
                         int rows,
                         UploadPlaneView& out,
                         std::string& error) {
-    // 尝试从 ffmpeg 原始视频帧中解析平面数据
-    if (const auto* raw = dynamic_cast<const FFmpegRawFrameBuffer*>(frame.buffer.get())) {
-        const int stride = raw->PlaneStride(plane);
-        const auto magnitude = stride < 0 ? -static_cast<std::int64_t>(stride) : stride;
-        if (!raw->IsValid() || !raw->PlaneData(plane) ||
-            row_bytes <= 0 || rows <= 0 || magnitude < row_bytes) {
-            error = "invalid raw video plane";
-            return false;
-        }
-        out.data = raw->PlaneData(plane);
-        out.stride = stride;
-        return true;
-    }
-    const auto* base = frame.buffer ? frame.buffer->Data() : nullptr;
-    const std::size_t size = frame.buffer ? frame.buffer->Size() : 0;
-    if (!base || size == 0) {
-        error = "video frame buffer is empty";
+    const auto slice = frame.PlaneView(plane);
+    const auto stride_magnitude = slice.geometry.stride < 0
+        ? static_cast<std::size_t>(-(slice.geometry.stride + 1)) + 1
+        : static_cast<std::size_t>(slice.geometry.stride);
+    assert(slice.geometry.stride > std::numeric_limits<int>::min());
+    assert(slice.geometry.stride < std::numeric_limits<int>::max());
+    assert(slice.geometry.row_bytes > 0);
+    assert(slice.geometry.rows > 0);
+    assert(row_bytes > 0);
+    assert(rows > 0);
+    
+    if (!slice.data || slice.geometry.row_bytes < row_bytes || slice.geometry.rows < rows || stride_magnitude < row_bytes) {
+        error = "invalid video plane view";
         return false;
     }
-    // 连续缓冲区的普通帧，使用 frame 的 stride 和 plane offset 解析平面数据。
-    const auto* meta = frame.VideoMeta();
-    if (meta->plane_count < 0 || meta->plane_count > 8 || (meta->plane_count > 0 && plane >= meta->plane_count) ||
-        frame.Stride(plane) < 0 || frame.PlaneOffset(plane) < 0) {
-        error = "invalid video plane metadata";
-        return false;
-    }
-    // 优先使用 frame 的 stride，否则使用 row_bytes 作为 stride。
-    const int stride = frame.Stride(plane) > 0 ? frame.Stride(plane) : row_bytes;
-    if (row_bytes <= 0 || rows <= 0 || stride < row_bytes) {
-        error = "invalid YUV plane stride";
-        return false;
-    }
-
-    // 优先使用 frame 的 plane offset，否则使用 fallback_offset。
-    const std::size_t offset = frame.PlaneOffset(plane) > 0 ? static_cast<std::size_t>(frame.PlaneOffset(plane)) : fallback_offset;
-    if (offset > size) {
-        error = "YUV plane offset exceeds frame buffer";
-        return false;
-    }
-
-    // 边界检查
-    const std::size_t last_row_offset = static_cast<std::size_t>(stride) * static_cast<std::size_t>(rows - 1);
-    const std::size_t remaining = size - offset;
-    if (last_row_offset > remaining || static_cast<std::size_t>(row_bytes) > remaining - last_row_offset) {
-        error = "YUV plane exceeds frame buffer";
-        return false;
-    }
-
-    out.data = base + offset;
-    out.stride = stride;
+    out.data = slice.data;
+    out.stride = slice.geometry.stride;
     return true;
 }
 
@@ -546,12 +511,20 @@ bool OpenGLVideoRenderer::uploadVideoTextures(const MediaFrame& frame, int& shad
     const int chroma_width = (width + 1) / 2;
     const int chroma_height = (height + 1) / 2;
     const auto format = frame.PixelFormat();
+    const std::size_t expected_planes =
+        format == PixelFormat::kI420 ? 3 :
+        (format == PixelFormat::kNV12 || format == PixelFormat::kNV21) ? 2 :
+        (format == PixelFormat::kRGB24 || format == PixelFormat::kBGR24 || format == PixelFormat::kGRAY8) ? 1 : 0;
+    if (expected_planes == 0 || frame.view.PlaneCount() != expected_planes) {
+        setError("video frame plane count does not match pixel format");
+        return false;
+    }
     std::string error;
     if (format == PixelFormat::kRGB24 || format == PixelFormat::kBGR24 || format == PixelFormat::kGRAY8) {
         const bool gray = format == PixelFormat::kGRAY8;
         const int row_bytes = width * (gray ? 1 : 3);
         UploadPlaneView packed;
-        if (!ResolveUploadPlane(frame, 0, 0, row_bytes, height, packed, error)) {
+        if (!ResolveUploadPlane(frame, 0, row_bytes, height, packed, error)) {
             setError(std::move(error));
             return false;
         }
@@ -567,12 +540,11 @@ bool OpenGLVideoRenderer::uploadVideoTextures(const MediaFrame& frame, int& shad
         return false;
     }
     UploadPlaneView y_plane;
-    if (!ResolveUploadPlane(frame, 0, 0, width, height, y_plane, error)) {
+    if (!ResolveUploadPlane(frame, 0, width, height, y_plane, error)) {
         setError(std::move(error));
         return false;
     }
 
-    const std::size_t y_size = static_cast<std::size_t>(y_plane.stride) * static_cast<std::size_t>(height);
     if (!uploadPlane(texture_y_,
                      texture_y_width_,
                      texture_y_height_,
@@ -592,7 +564,6 @@ bool OpenGLVideoRenderer::uploadVideoTextures(const MediaFrame& frame, int& shad
         UploadPlaneView uv_plane;
         if (!ResolveUploadPlane(frame,
                                 1,
-                                y_size,
                                 chroma_width * 2,
                                 chroma_height,
                                 uv_plane,
@@ -622,7 +593,6 @@ bool OpenGLVideoRenderer::uploadVideoTextures(const MediaFrame& frame, int& shad
         UploadPlaneView u_plane;
         if (!ResolveUploadPlane(frame,
                                 1,
-                                y_size,
                                 chroma_width,
                                 chroma_height,
                                 u_plane,
@@ -630,11 +600,9 @@ bool OpenGLVideoRenderer::uploadVideoTextures(const MediaFrame& frame, int& shad
             setError(std::move(error));
             return false;
         }
-        const std::size_t u_size = static_cast<std::size_t>(u_plane.stride) * static_cast<std::size_t>(chroma_height);
         UploadPlaneView v_plane;
         if (!ResolveUploadPlane(frame,
                                 2,
-                                y_size + u_size,
                                 chroma_width,
                                 chroma_height,
                                 v_plane,

@@ -7,6 +7,7 @@
 #include <variant>
 #include <memory>
 #include "media_buffer.h"
+#include "frame_layout.h"
 #include "media_packet.h"
 
 /// 像素格式
@@ -43,39 +44,11 @@ struct MediaTime {
     int64_t duration_us{0}; ///< 持续时间（微秒）
 };
 
-/// @brief 平面信息
-struct PlaneInfo {
-    int32_t offset{0}; ///< 平面数据偏移（字节）
-    int32_t stride{0}; ///< 平面行跨度（字节）
-    int32_t size{0};     ///< 平面数据大小（字节）
-};
-
-/// @brief 带 stride 填充的源缓冲区中单个平面的布局参数
-struct StridedPlaneEntry {
-    int rows = 0;               ///< 本平面行数
-    int row_bytes = 0;          ///< 每行有效字节数（不含填充）
-    int source_stride = 0;      ///< 缓冲区行跨度（含填充）
-    std::size_t source_offset = 0; ///< 本平面在源缓冲区中的字节偏移
-};
-
-/// @brief 带 stride 填充的源缓冲区的完整平面布局
-struct SourcePlaneLayout {
-    int plane_count = 0;
-    StridedPlaneEntry planes[3];
-
-    bool is_empty() const { return plane_count <= 0; }
-
-    /// 根据像素格式、宽高和源行跨度计算各平面的布局参数
-    static SourcePlaneLayout Compute(PixelFormat format, int width, int height, int source_stride);
-};
-
 /// @brief struct VideoFrameMeta 视频帧元数据
 struct VideoFrameMeta {
     PixelFormat pixel_format{PixelFormat::kUnknown}; ///< 像素格式
     int32_t     width{0};                           ///< 图像宽度（像素）
     int32_t     height{0};                          ///< 图像高度（像素）
-    int32_t     plane_count{0};                        ///< 平面数量
-    PlaneInfo   plane_info[8] {0}; ///< 平面信息
 };
 
 struct AudioFrameMeta {
@@ -86,38 +59,26 @@ struct AudioFrameMeta {
     int nb_samples{0};                               ///< 样本数
     int bytes_per_sample{0};                        ///< 每个样本字节数
     bool planar{false};                             ///< 是否为平面格式
-    int32_t plane_count{0};                         ///< 平面数量
-    PlaneInfo planes[8]{};                          ///< 平面信息
 };
 
 using FrameMeta = std::variant<VideoFrameMeta, AudioFrameMeta>;
 
 /// @brief 紧凑帧中单个平面的视图
-struct PlaneSlice {
-    const uint8_t* data = nullptr; ///< 平面起始地址
-    int stride = 0;               ///< 行跨度（字节）
-    int row_bytes = 0;            ///< 每行有效像素字节数
-    int rows = 0;                 ///< 本平面行数
-};
+
 
 /// 媒体帧：解码后的图像数据及其描述信息
 class MediaFrame {
 public:
     MediaType    type{MediaType::VIDEO};              ///< 媒体类型（VIDEO/AUDIO）
     MediaTime   time;                               ///< 时间戳信息
-    FrameMeta meta;                                 ///< 媒体帧元数据
-
-    // 普通帧通常由 SimpleBuffer 持有连续数据；FFmpeg 后端帧也可以由
-    // FFmpegRawFrameBuffer 持有多平面 AVFrame，此时不能通过 Data()/Size()
-    // 访问整帧，而应使用 backend.ptr 或 raw buffer 的平面接口。    
-    std::shared_ptr<IMediaBuffer> buffer;
-    MediaBufferView view;           ///< 媒体数据缓冲区    
-    BackendHandle backend;                          ///< 所有权句柄
+    FrameMeta meta;                                 ///< 媒体帧元数据    
+    MediaBufferView view;           ///< 媒体数据缓冲区视图
+    BackendHandle backend;                          ///< 非拥有后端指针，由 view 保活
 
     /// @brief 将带 stride 填充的源数据紧凑打包为自描述的 MediaFrame（零拷贝版本）
     /// 源数据由 shared_ptr 持有所有权。当布局已满足紧凑条件
-    /// （各 plane stride==row_bytes 且平面间连续）时，直接包装为 SimpleBufferView 跳过 memcpy；
-    /// 否则从 shared_ptr 读取并拷贝到 SimpleBuffer。
+    /// （各 plane stride==row_bytes 且平面间连续）时，直接包装为 MediaBufferView 跳过 memcpy；
+    /// 否则从 shared_ptr 读取并拷贝到独立存储。
     /// @param source_data  拥有源数据所有权的 shared_ptr
     /// @param source_bytes 源缓冲区总大小
     /// @param format       像素格式
@@ -131,7 +92,7 @@ public:
     static std::shared_ptr<MediaFrame> CreateCompact(const unsigned char* source_data, std::size_t source_bytes,
         PixelFormat format, int width, int height, int source_stride);
 
-    /// @brief 拷贝到外部预分配缓冲区，返回的 MediaFrame 通过 SimpleBufferView 引用目标内存
+    /// @brief 拷贝到外部预分配缓冲区，返回的 MediaFrame 通过 MediaBufferView 引用目标内存
     ///       调用方需保证 dest 在帧存活期间有效
     /// @param dest          预分配的目标缓冲区
     /// @param dest_capacity 目标缓冲区容量，必须 >= 紧凑格式所需大小
@@ -141,8 +102,8 @@ public:
         uint8_t* dest, std::size_t dest_capacity);
 
     /// @brief 从紧凑 MediaFrame 中解析指定平面的视图
-    /// @return PlaneSlice，若 index 越界或元数据无效则 data 为 nullptr
-    PlaneSlice GetPlaneSlice(int plane_index) const;
+    /// @return MediaPlaneView，若 index 越界或元数据无效则 data 为 nullptr
+    MediaPlaneView PlaneView(int plane_index) const;
 
     /// @brief 获取视频元数据（若 type 为 VIDEO）
     const VideoFrameMeta* VideoMeta() const {
@@ -180,9 +141,7 @@ public:
 
     /// @brief 获取平面数量
     int32_t PlaneCount() const {
-        if (auto* v = VideoMeta()) return v->plane_count;
-        if (auto* a = AudioMeta()) return a->plane_count;
-        return 0;
+        return static_cast<int32_t>(view.PlaneCount());
     }
 
     /// @brief 获取指定平面的 stride
@@ -190,19 +149,7 @@ public:
         if (index < 0 || index >= PlaneCount()) {
             return 0;
         }
-        if (auto* v = VideoMeta()) return v->plane_info[index].stride;
-        if (auto* a = AudioMeta()) return a->planes[index].stride;
-        return 0;
-    }
-
-    /// @brief 获取指定平面的 offset
-    int32_t PlaneOffset(int index) const {
-        if (index < 0 || index >= PlaneCount()) {
-            return 0;
-        }
-        if (auto* v = VideoMeta()) return v->plane_info[index].offset;
-        if (auto* a = AudioMeta()) return a->planes[index].offset;
-        return 0;
+        return static_cast<int32_t>(view.Geometry(static_cast<std::size_t>(index)).stride);
     }
 
     /// @brief 获取样本数（音频）

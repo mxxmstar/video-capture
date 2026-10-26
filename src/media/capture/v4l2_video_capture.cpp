@@ -44,7 +44,9 @@ unsigned int Fourcc(PixelFormat format) {
 PixelFormat Pixel(unsigned int format) {
     switch (format) {
     case V4L2_PIX_FMT_YUYV: return PixelFormat::kYUYV422;
+    case V4L2_PIX_FMT_NV12M:
     case V4L2_PIX_FMT_NV12: return PixelFormat::kNV12;
+    case V4L2_PIX_FMT_YUV420M:
     case V4L2_PIX_FMT_YUV420: return PixelFormat::kI420;
     default: return PixelFormat::kUnknown;
     }
@@ -175,6 +177,18 @@ CaptureOpenResult V4L2VideoCapture::Open() {
         format.fmt.pix_mp.width = static_cast<unsigned int>(config_.width);
         format.fmt.pix_mp.height = static_cast<unsigned int>(config_.height);
         format.fmt.pix_mp.pixelformat = Fourcc(config_.pixel_format);
+        const auto separate_format = config_.pixel_format == PixelFormat::kNV12 ? V4L2_PIX_FMT_NV12M :
+            (config_.pixel_format == PixelFormat::kI420 ? V4L2_PIX_FMT_YUV420M : Fourcc(config_.pixel_format));
+        for (unsigned index = 0; ; ++index) {
+            v4l2_fmtdesc descriptor{};
+            descriptor.index = index;
+            descriptor.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            if (Ioctl(device_fd_, VIDIOC_ENUM_FMT, &descriptor) < 0) break;
+            if (descriptor.pixelformat == separate_format) {
+                format.fmt.pix_mp.pixelformat = separate_format;
+                break;
+            }
+        }
         format.fmt.pix_mp.field = V4L2_FIELD_NONE;
         is_mplane_ = true;
     } else if (capabilities & V4L2_CAP_VIDEO_CAPTURE) {
@@ -209,7 +223,7 @@ CaptureOpenResult V4L2VideoCapture::Open() {
     }
     // 共用校验：不允许协商时检查设备是否调整了格式
     if (!config_.allow_negotiation && (width != static_cast<unsigned int>(config_.width) ||
-        height != static_cast<unsigned int>(config_.height) || pixelformat != Fourcc(config_.pixel_format))) {
+        height != static_cast<unsigned int>(config_.height) || Pixel(pixelformat) != config_.pixel_format)) {
         return failed({CaptureErrorCategory::Unsupported, 0, "Device adjusted requested capture format", false});
     }
     const auto pixel = Pixel(pixelformat);
@@ -427,52 +441,57 @@ CaptureReadResult V4L2VideoCapture::ReadFrame() {
         }
 
         const auto lease_view = lease->View();
-        const auto source = lease_view.Data(0);
         const auto stride = plane_geometry_.empty() ? 0 : static_cast<int>(plane_geometry_[0].stride);
-        if (config_.delivery_mode == V4L2DeliveryMode::CopyCompact || config_.delivery_mode == V4L2DeliveryMode::Copy) {
-            frame = MediaFrame::CreateCompact(source.data(), source.size(), info_.pixel_format, info_.width, info_.height, stride);
+        const auto layout = PlaneLayout::Compute(info_.pixel_format, info_.width, info_.height, stride);
+        if (layout.IsEmpty()) throw std::invalid_argument("Invalid captured frame layout");
+        std::vector<MediaPlaneView> logical_views;
+        logical_views.reserve(layout.planes.size());
+        const bool source_is_contiguous = lease_view.PlaneCount() == 1;
+        ConstBufferRegion source_region{};
+        if (source_is_contiguous) {
+            const auto base = lease_view.Data(0);
+            source_region = {base.data(), base.size()};
+            for (std::size_t i = 0; i < layout.planes.size(); ++i) {
+                const auto& pl = layout.planes[i];
+                const auto source_stride = static_cast<std::size_t>(pl.geometry.stride);
+                const auto span = (pl.geometry.rows - 1) * source_stride + pl.geometry.row_bytes;
+                if (pl.source_offset > base.size() || span > base.size() - pl.source_offset)
+                    throw std::invalid_argument("Truncated captured logical plane");
+                logical_views.emplace_back(base.data() + pl.source_offset, span,
+                    pl.geometry);
+            }
         } else {
-            // 非紧凑模式，解析平面视图
-            const auto layout = SourcePlaneLayout::Compute(info_.pixel_format, info_.width, info_.height, stride);
-            if (layout.is_empty()) throw std::invalid_argument("Invalid leased frame layout");
-            VideoFrameMeta meta{};
-            meta.width = info_.width;
-            meta.height = info_.height;
-            meta.pixel_format = info_.pixel_format;
-            meta.plane_count = layout.plane_count;
-            for (int i = 0; i < layout.plane_count; ++i) {
-                const auto& plane = layout.planes[i];
-                const auto span = static_cast<std::size_t>(plane.rows - 1) * plane.source_stride + plane.row_bytes;
-                if (plane.source_offset > INT_MAX || span > INT_MAX || plane.source_offset > source.size() || span > source.size() - plane.source_offset)
-                    throw std::invalid_argument("Truncated leased frame plane");
-                meta.plane_info[i] = PlaneInfo{static_cast<int>(plane.source_offset), plane.source_stride, static_cast<int>(span)};
+            if (lease_view.PlaneCount() != layout.planes.size())
+                throw std::invalid_argument("Unexpected captured memory plane count");
+            for (std::size_t i = 0; i < layout.planes.size(); ++i) {
+                const auto* source = lease_view.Plane(i);
+                const auto& pl = layout.planes[i];
+                if (!source || static_cast<std::size_t>(i) >= plane_geometry_.size())
+                    throw std::invalid_argument("Missing captured memory plane");
+                logical_views.emplace_back(source->data, source->size,
+                    PlaneGeometry{plane_geometry_[i].stride, pl.geometry.row_bytes, pl.geometry.rows});
             }
-            frame = std::make_shared<MediaFrame>();
-            frame->meta = meta;
-            std::vector<MediaPlaneView> logical_views;
-            std::shared_ptr<const void> lease_owner = lease;    // 隐式转换为 void*作为 logical_views 的所有者
-            if (lease_view.PlaneCount() == 1) {
-                const auto base = lease_view.Data(0);
-                for (int i = 0; i < layout.plane_count; ++i) {
-                    const auto& pl = layout.planes[i];
-                    const auto span = static_cast<std::size_t>(pl.rows - 1) * pl.source_stride + pl.row_bytes;
-                    if (pl.source_offset > base.size() || span > base.size() - pl.source_offset)
-                        throw std::invalid_argument("Truncated leased logical plane");
-                    logical_views.emplace_back(base.data() + pl.source_offset, span,
-                        PlaneGeometry{pl.source_stride, static_cast<std::size_t>(pl.row_bytes), static_cast<std::size_t>(pl.rows)});
-                }
-            } else {
-                if (lease_view.PlaneCount() < static_cast<std::size_t>(layout.plane_count))
-                    throw std::invalid_argument("Insufficient leased memory planes");
-                for (int i = 0; i < layout.plane_count; ++i) {
-                    const auto source_plane = lease_view.Plane(static_cast<std::size_t>(i));
-                    if (!source_plane) throw std::invalid_argument("Missing leased plane");
-                    const auto& pl = layout.planes[i];
-                    logical_views.emplace_back(source_plane->data, source_plane->size,
-                        PlaneGeometry{pl.source_stride, static_cast<std::size_t>(pl.row_bytes), static_cast<std::size_t>(pl.rows)});
-                }
-            }
-            frame->view = MediaBufferView(std::move(logical_views), std::move(lease_owner));
+        }
+        for (const auto& pl : logical_views) {
+            if (!pl.IsValid()) throw std::invalid_argument("Invalid captured plane span");
+        }
+        frame = std::make_shared<MediaFrame>();
+        VideoFrameMeta meta{};
+        meta.width = info_.width;
+        meta.height = info_.height;
+        meta.pixel_format = info_.pixel_format;
+        frame->meta = meta;
+        if (config_.delivery_mode == V4L2DeliveryMode::CopyCompact || config_.delivery_mode == V4L2DeliveryMode::Copy) {
+            MediaBufferView source_view(std::move(logical_views), lease);
+            auto owned = config_.delivery_mode == V4L2DeliveryMode::CopyCompact
+                ? MediaBuffer::CopyContiguous(source_view)
+                : MediaBuffer::CopySeparatePlanes(source_view);
+            if (!owned) throw std::invalid_argument("Failed to copy captured frame planes");
+            frame->view = MediaBufferView::FromOwner(std::move(owned));
+        } else {
+            frame->view = source_is_contiguous
+                ? MediaBufferView::FromContiguous(std::move(logical_views), source_region, lease)
+                : MediaBufferView::FromPlanes(std::move(logical_views), lease);
         }
         if (!frame) {
             copy_error = CaptureError{CaptureErrorCategory::InvalidFrame, 0, "CreateCompact failed", false};
@@ -556,4 +575,5 @@ void V4L2VideoCapture::cleanup() noexcept {
         wake_fd_ = -1;
     }
     info_ = {};
+    plane_geometry_.clear();
 }
