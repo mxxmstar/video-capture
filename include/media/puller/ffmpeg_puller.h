@@ -18,7 +18,7 @@ extern "C" {
 ///
 /// 实现 IPuller 纯虚接口，仅负责：
 ///   - Open()       — 创建 AVFormatContext、查找视频流、缓存 StreamInfo
-///   - ReadPacket() — av_read_frame -> MediaPacket（零拷贝 FFmpegPacketBuffer）
+///   - ReadPacket() — av_read_frame -> MediaPacket（零拷贝 MediaPacketBuffer + AVPacket owner）
 ///   - Close()      — avformat_close_input
 ///
 /// 不负责重连 / watchdog / 状态机 / 统计（均由 StreamSession 管理）。

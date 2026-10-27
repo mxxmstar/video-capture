@@ -2,8 +2,8 @@
 /// @brief 使用测试内假拉流器验证 MediaStreamSession 的基础状态和统计。
 
 #include "media/puller/i_puller.h"
-#include "media/ffmpeg_packet_buffer.h"
-#include "media/simple_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
+#include "media/media_packet_buffer.h"
 #include "media/stream/stream_session.h"
 
 #include <boost/asio/io_context.hpp>
@@ -165,7 +165,7 @@ private:
 /// @brief 创建一个成功读取结果。
 ///
 /// 为了让测试聚焦 Session，本函数构造最小但有效的 MediaPacket：它有
-/// 视频类型、H.264 编码和一个 16 字节的 SimpleBuffer。Session 收到它后
+/// 视频类型、H.264 编码和一个 16 字节的 MediaPacketBuffer。Session 收到它后
 /// 应该调用 PacketCallback，并把包数和字节数分别加一和加 16。
 PullReadResult MakePacketResult(std::size_t size) {
     auto packet = std::make_shared<MediaPacket>();
@@ -177,7 +177,7 @@ PullReadResult MakePacketResult(std::size_t size) {
     packet->duration = 40;
     packet->time_base = {1, 1000};
     packet->keyframe = true;
-    packet->buffer = std::make_shared<SimpleBuffer>(
+    packet->buffer = std::make_shared<MediaPacketBuffer>(
         std::vector<std::uint8_t>(size, 0x5A));
 
     return {
@@ -221,7 +221,7 @@ PullReadResult MakeTimestampedPacket(
     packet->duration = 40;
     packet->time_base = {1, 1000};
     packet->keyframe = keyframe;
-    packet->buffer = std::make_shared<FFmpegPacketBuffer>(av_packet);
+    Media::BindAVPacket(*packet, Media::OwnAVPacket(av_packet));
     packet->backend.type = BackendHandle::FFMPEG;
     packet->backend.ptr = av_packet;
     return {

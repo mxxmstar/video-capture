@@ -1,7 +1,7 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/publisher/publisher.h"
-#include "media/simple_buffer.h"
+#include "media/media_buffer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,8 +42,8 @@ FramePtr MakeFrame(int index) {
     std::vector<std::uint8_t> pixels(kWidth * kHeight * 3 / 2, 128);
     std::fill_n(pixels.begin(), kWidth * kHeight,
                 static_cast<std::uint8_t>(32 + index * 16));
-    auto frame_owner = std::make_shared<SimpleBuffer>(std::move(pixels));
-    const auto* base = frame_owner->Data();
+    auto frame_owner = std::make_shared<const std::vector<uint8_t>>(std::move(pixels));
+    const auto* base = frame_owner->data();
     std::vector<MediaPlaneView> planes{
         {base, kWidth * kHeight, PlaneGeometry{kWidth, kWidth, kHeight}},
         {base + kWidth * kHeight, kWidth * kHeight / 4,
@@ -52,7 +52,7 @@ FramePtr MakeFrame(int index) {
             PlaneGeometry{kWidth / 2, kWidth / 2, kHeight / 2}},
     };
     frame->view = MediaBufferView::FromContiguous(std::move(planes),
-        ConstBufferRegion{base, frame_owner->Size()}, frame_owner);
+        ConstBufferRegion{base, frame_owner->size()}, frame_owner);
     return frame;
 }
 

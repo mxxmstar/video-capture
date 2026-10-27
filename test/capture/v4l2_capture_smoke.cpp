@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    // ========== 正常模式：采集 → 转换 → 编码 → 输出 MP4 ==========
+    // ========== 正常模式：采集 -> 转换 -> 编码 -> 输出 MP4 ==========
     if (argc != 4) {
         std::cerr << "Usage: v4l2_capture_smoke DEVICE yuyv|nv12|i420 OUTPUT.mp4\n";
         return 2;
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
                 "Stop test did not reach a blocked read");
 
         const auto stop_start = std::chrono::steady_clock::now();
-        idle.RequestStop();                                    // write(wake_fd_) → 唤醒 poll
+        idle.RequestStop();                                    // write(wake_fd_) -> 唤醒 poll
         // eventfd 必须在 500ms 内中断 poll 并返回 Stopped（不应等完 3s 超时）
         Require(pending.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready,
                 "eventfd did not interrupt poll within 500ms");
@@ -198,8 +198,8 @@ int main(int argc, char** argv) {
         std::cout << "Blocked read stop: " << std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - stop_start).count() << " us\n";
 
-        // ========== 测试 4: 完整管线——采集 → 格式转换 → H264 编码 → MP4 输出 ==========
-        // --- 初始化格式转换器（YUYV/NV12 → I420） ---
+        // ========== 测试 4: 完整管线——采集 -> 格式转换 -> H264 编码 -> MP4 输出 ==========
+        // --- 初始化格式转换器（YUYV/NV12 -> I420） ---
         MediaFrameConverter converter;
         MediaFrameConverterConfig conversion;
         conversion.video = {config.width, config.height, PixelFormat::kI420, 2};
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
         int64_t previous_dts = kNoTimestamp;
         const auto write_packets = [&](const std::vector<PacketPtr>& packets) {
             for (const auto& packet : packets) {
-                Require(packet && packet->buffer && packet->buffer->IsContiguous(), "Invalid encoded packet");
+                Require(packet && packet->buffer && !packet->buffer->Empty(), "Invalid encoded packet");
                 Require(IsValidTimestamp(packet->dts) && (!IsValidTimestamp(previous_dts) ||
                     packet->dts > previous_dts), "Invalid encoded DTS");
                 previous_dts = packet->dts;
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
             }
         };
 
-        // --- 启动采集会话，以回调方式驱动采集 → 转换 → 编码 → 发布 全链路 ---
+        // --- 启动采集会话，以回调方式驱动采集 -> 转换 -> 编码 -> 发布 全链路 ---
         std::mutex mutex;
         std::condition_variable cv;
         std::atomic<int> frames{0};
@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
             frame->time.pts_us -= epoch;
             frame->time.dts_us = frame->time.pts_us;
 
-            // 格式转换 → H264 编码 → 写入 MP4
+            // 格式转换 -> H264 编码 -> 写入 MP4
             std::shared_ptr<MediaFrame> converted;
             Require(converter.Convert(*frame, converted), "Capture frame conversion failed");
             std::vector<PacketPtr> packets;
@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
             cv.notify_all();
         });
 
-        // 启动采集会话（后台线程执行 ReadFrame → 回调）
+        // 启动采集会话（后台线程执行 ReadFrame -> 回调）
         const auto opened = session.Start();
         if (opened.error) throw std::runtime_error(opened.error->message);
 

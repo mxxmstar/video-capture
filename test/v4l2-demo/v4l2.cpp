@@ -1,6 +1,5 @@
 #include "render/video/opengl_video_renderer.h"
 #include "media/converter/media_frame_converter.h"
-#include "media/simple_buffer.h"
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -160,7 +159,7 @@ void PrintTimestampClock(const v4l2_buffer& buf, int frame_count) {
         std::cout << "timestamp clock: CLOCK_REALTIME (may drift with NTP)\n";
 }
 
-// V4L2 timeval → 微秒
+// V4L2 timeval -> 微秒
 int64_t TimevalToUs(const timeval& tv) {
     return static_cast<int64_t>(tv.tv_sec) * 1'000'000LL + tv.tv_usec;
 }
@@ -260,7 +259,7 @@ bool DequeueMultiPlaneBuffer(int fd, v4l2_buffer& buf, v4l2_plane* planes,
 } // namespace
 
 // ================================================================
-//  Demo 1: 单平面 YUYV 采集 → I420 转换 → OpenGL 渲染
+//  Demo 1: 单平面 YUYV 采集 -> I420 转换 -> OpenGL 渲染
 // ================================================================
 int v4l2_demo(int argc, char* argv[]) {
     const char* device = (argc > 1) ? argv[1] : "/dev/video0";
@@ -368,7 +367,7 @@ int v4l2_demo(int argc, char* argv[]) {
 }
 
 // ================================================================
-//  Demo 2: 多平面 YUV420M (mmap) → I420 → OpenGL 渲染
+//  Demo 2: 多平面 YUV420M (mmap) -> I420 -> OpenGL 渲染
 // ================================================================
 int v4l2_multiplane_demo(int argc, char* argv[]) {
     const char* device = (argc > 1) ? argv[1] : "/dev/video1";
@@ -472,7 +471,7 @@ int v4l2_multiplane_demo(int argc, char* argv[]) {
 }
 
 // ================================================================
-//  Demo 3: 多平面 YUV420M (DMA-BUF 零拷贝) → OpenGL 渲染
+//  Demo 3: 多平面 YUV420M (DMA-BUF 零拷贝) -> OpenGL 渲染
 // ================================================================
 int v4l2_multiplane_dma_demo(int argc, char* argv[]) {
     const char* device = (argc > 1) ? argv[1] : "/dev/video1";

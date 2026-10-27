@@ -8,7 +8,7 @@
 #include <memory>
 #include <string>
 
-#include "media/i_media_buffer.h"
+#include "media/media_packet_buffer.h"
 #include "common/log/logger.h"
 /// 媒体流类型
 enum class MediaType : int {    
@@ -82,7 +82,7 @@ public:
     Rational time_base{1, 1000000};                ///< 时间戳使用的时间基
 
     bool       keyframe{false};                   ///< 是否为关键帧
-    std::shared_ptr<IMediaBuffer> buffer;          ///< 编码数据载荷
+    std::shared_ptr<MediaPacketBuffer> buffer;          ///< 编码数据载荷
     BackendHandle backend;                         ///< 所有权
 
     void Dump() const {

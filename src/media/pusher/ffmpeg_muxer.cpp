@@ -1,3 +1,4 @@
+#include "media/ffmpeg_packet_utils.h"
 #include "media/pusher/ffmpeg_muxer.h"
 #include "common/log/logger.h"
 #include "media/pusher/pusher_config.h"
@@ -222,7 +223,9 @@ MuxerResult FFmpegMuxer::Write(const MediaPacket& packet) {
     if (interrupt_ctx_.stop_requested.load()) {
         return failure(MuxerOperation::WritePacket, MuxerErrorCategory::Cancelled, AVERROR_EXIT);
     }
-    auto* av_packet = static_cast<AVPacket*>(packet.backend.ptr);
+    auto* av_packet = const_cast<AVPacket*>(Media::GetBackendPacket(packet));
+    if (!av_packet || !IsValidTimeBase(packet.time_base))
+        return failure(MuxerOperation::WritePacket, MuxerErrorCategory::Internal, AVERROR(EINVAL));
 
     // MediaPacket 是跨模块传递的统一元数据，使用它覆盖 AVPacket 中的时间戳，
     // 避免两个表示不一致时，Muxer 靠一个未说明来源的值写包。

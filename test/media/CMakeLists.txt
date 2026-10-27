@@ -33,7 +33,6 @@ set(RAW_FRAME_CONTRACT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_raw_frame_contract
 if(EXISTS "${RAW_FRAME_CONTRACT_TEST}")
     add_executable(test_media_raw_frame_contract
         "${RAW_FRAME_CONTRACT_TEST}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../src/media/ffmpeg_raw_frame_buffer.cpp"
     )
     target_include_directories(test_media_raw_frame_contract
         PRIVATE

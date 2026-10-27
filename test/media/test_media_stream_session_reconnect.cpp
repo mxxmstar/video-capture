@@ -2,7 +2,7 @@
 /// @brief 使用假 Puller 验证 MediaStreamSession 的最小重连流程。
 
 #include "media/puller/i_puller.h"
-#include "media/simple_buffer.h"
+#include "media/media_packet_buffer.h"
 #include "media/stream/stream_session.h"
 
 #include <boost/asio/io_context.hpp>
@@ -191,7 +191,7 @@ PullReadResult MakePacketResult(std::size_t size) {
     packet->duration = 40;
     packet->time_base = {1, 1000};
     packet->keyframe = true;
-    packet->buffer = std::make_shared<SimpleBuffer>(
+    packet->buffer = std::make_shared<MediaPacketBuffer>(
         std::vector<std::uint8_t>(size, 0x5A));
 
     return {
@@ -215,7 +215,7 @@ PullReadResult MakeTimestampedPacket(
     packet->duration = 40;
     packet->time_base = time_base;
     packet->keyframe = keyframe;
-    packet->buffer = std::make_shared<SimpleBuffer>(
+    packet->buffer = std::make_shared<MediaPacketBuffer>(
         std::vector<std::uint8_t>(16, 0x5A));
     return {
         std::nullopt,

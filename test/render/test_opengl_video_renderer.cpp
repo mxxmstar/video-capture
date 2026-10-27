@@ -1,6 +1,6 @@
 #include "render/video/opengl_video_renderer.h"
-#include "media/simple_buffer.h"
-#include "media/ffmpeg_raw_frame_buffer.h"
+#include "media/media_buffer.h"
+#include "media/ffmpeg_frame_owner.h"
 #include "media/ffmpeg_frame_view.h"
 
 #include <glad/glad.h>
@@ -15,8 +15,8 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/publisher/publisher.h"
-#include "media/ffmpeg_raw_frame_buffer.h"
-#include "media/simple_buffer.h"
+#include "media/ffmpeg_frame_owner.h"
+#include "media/media_buffer.h"
 #include "common/log/logger.h"
 
 #include <algorithm>
@@ -106,8 +106,8 @@ MediaFrame MakeFrame(PixelFormat format) {
         }
     }
     frame.meta = meta;
-    auto frame_owner = std::make_shared<SimpleBuffer>(std::move(bytes));
-    const auto* base = frame_owner->Data();
+    auto frame_owner = std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+    const auto* base = frame_owner->data();
     std::vector<MediaPlaneView> planes;
     if (rgb) {
         planes.emplace_back(base + 5, 31, PlaneGeometry{11, 9, 3});
@@ -122,7 +122,7 @@ MediaFrame MakeFrame(PixelFormat format) {
         planes.emplace_back(base + 24, 9, PlaneGeometry{5, 4, 2});
     }
     frame.view = MediaBufferView::FromContiguous(std::move(planes),
-        ConstBufferRegion{base, frame_owner->Size()}, frame_owner);
+        ConstBufferRegion{base, frame_owner->size()}, frame_owner);
     return frame;
 }
 
@@ -348,16 +348,15 @@ int main() {
     meta.width = raw->width; meta.height = raw->height;
     meta.pixel_format = PixelFormat::kRGB24;
     raw_frame.meta = meta;
-    auto raw_frame_owner = std::make_shared<FFmpegRawFrameBuffer>(raw);
-    raw_frame.view = Media::MakeFFmpegFrameView(*raw, std::shared_ptr<const AVFrame>(raw_frame_owner, raw));
+    auto raw_frame_owner = Media::OwnAVFrame(raw);
+    raw_frame.view = Media::MakeFFmpegFrameView(*raw, raw_frame_owner);
     if (!CheckPixel(renderer, raw_frame, {0, 255, 0})) return 1;
     raw->data[0] += (raw->height - 1) * raw->linesize[0];
     raw->linesize[0] = -raw->linesize[0];
-    raw_frame.view = Media::MakeFFmpegFrameView(*raw, std::shared_ptr<const AVFrame>(raw_frame_owner, raw));
+    raw_frame.view = Media::MakeFFmpegFrameView(*raw, raw_frame_owner);
     if (!CheckPixel(renderer, raw_frame, {0, 255, 0})) return 1;
 
     auto invalid = MakeFrame(PixelFormat::kRGB24);
-    auto invalid_owner = std::make_shared<SimpleBuffer>();
     invalid.view = {};
     if (!Check(!renderer.Render(invalid), "empty buffer accepted")) return 1;
     invalid = MakeFrame(PixelFormat::kRGB24);

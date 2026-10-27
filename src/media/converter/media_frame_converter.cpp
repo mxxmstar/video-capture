@@ -2,8 +2,7 @@
 
 #include "media/converter/ffmpeg_audio_converter.h"
 #include "media/converter/ffmpeg_video_converter.h"
-#include "media/ffmpeg_frame_buffer.h"
-#include "media/ffmpeg_raw_frame_buffer.h"
+#include "media/ffmpeg_frame_owner.h"
 #include "media/ffmpeg_format.h"
 #include "media/ffmpeg_frame_view.h"
 
@@ -754,35 +753,22 @@ bool MediaFrameConverter::AdoptAVFrame(AVFrame* av_frame, std::shared_ptr<MediaF
         return false;
     }
 
-    // 先验证并生成元数据，再把 AVFrame 的所有权交给 raw buffer。
-    // 这样任何校验失败都仍由本函数负责释放传入的 AVFrame。
-    const auto frame_deleter = [](AVFrame* frame) {
-        av_frame_free(&frame);
-    };
-    std::unique_ptr<AVFrame, decltype(frame_deleter)> owned_frame(av_frame, frame_deleter);
-
+    auto owner = Media::OwnAVFrame(av_frame);
     MediaType media_type = MediaType::UNKNOWN;
     FrameMeta meta;
-    if (!FillRawFrameMeta(*av_frame, media_type, meta, last_error_)) {
-        return false;
-    }
+    if (!FillRawFrameMeta(*owner, media_type, meta, last_error_)) return false;
 
-    // make_shared 失败时 owned_frame 仍会释放 AVFrame。构造成功后再 release，
-    // 从而把唯一所有权明确转交给 FFmpegRawFrameBuffer。
-    auto raw_buffer = std::make_shared<FFmpegRawFrameBuffer>(owned_frame.get());
-    owned_frame.release();
     MediaFrame result;
     result.type = media_type;
     result.meta = std::move(meta);
-    result.view = MakeFFmpegFrameView(*raw_buffer->GetFrame(),
-        std::shared_ptr<const AVFrame>(raw_buffer, raw_buffer->GetFrame()));
+    result.view = MakeFFmpegFrameView(*owner, owner);
     if (result.view.PlaneCount() == 0) {
         last_error_ = "Invalid raw AVFrame layout";
         return false;
     }
     result.backend.type = BackendHandle::FFMPEG;
-    result.backend.ptr = raw_buffer->GetFrame();
-    SetMediaFrameTime(*raw_buffer->GetFrame(), &result);
+    result.backend.ptr = owner.get();
+    SetMediaFrameTime(*owner, &result);
     output = std::make_shared<MediaFrame>(std::move(result));
     return true;
 }

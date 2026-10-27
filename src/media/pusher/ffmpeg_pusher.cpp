@@ -1,5 +1,5 @@
 #include "media/pusher/ffmpeg_pusher.h"
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -301,8 +301,8 @@ PusherResult FFmpegPusher::Push(const MediaPacket& packet) {
                            "FFmpegPusher received an invalid FFmpeg media packet");
     }
 
-    const auto* av_packet = static_cast<const AVPacket*>(packet.backend.ptr);
-    if (!av_packet->data || av_packet->size <= 0 ||
+    const auto* av_packet = Media::GetBackendPacket(packet);
+    if (!av_packet || !av_packet->data || av_packet->size <= 0 ||
         (IsValidTimestamp(packet.duration) && packet.duration < 0)) {
         return MakeFailure(PusherErrorCategory::InvalidPacket, "Invalid AVPacket payload or duration");
     }
@@ -313,8 +313,7 @@ PusherResult FFmpegPusher::Push(const MediaPacket& packet) {
         return MakeFailure(PusherErrorCategory::Internal, "Could not clone AVPacket for output");
     }
     MediaPacket writable = packet;
-    writable.buffer = std::make_shared<FFmpegPacketBuffer>(writable_packet);
-    writable.backend.ptr = writable_packet;
+    Media::BindAVPacket(writable, Media::OwnAVPacket(writable_packet));
     const auto result = muxer_.Write(writable);
     if (!result.Succeed()) {
         opened_ = false;

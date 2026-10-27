@@ -8,7 +8,7 @@
 
 #include "common/log/logger.h"
 #include "media/ffmpeg_format.h"
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 
 extern "C" {
 #include <libavutil/error.h>
@@ -542,6 +542,7 @@ PullReadResult FFmpegPuller::ReadPacket() {
     }
 
     // 2. 转移数据所有权（零拷贝）
+    auto packet_owner = Media::OwnAVPacket(owned_packet);
     av_packet_move_ref(owned_packet, packet);
     av_packet_unref(packet);
     {
@@ -566,10 +567,7 @@ PullReadResult FFmpegPuller::ReadPacket() {
     // media_packet->duration = owned_packet->duration;
     media_packet->time_base = {stream->time_base.num, stream->time_base.den};
     media_packet->keyframe = (owned_packet->flags & AV_PKT_FLAG_KEY) != 0;
-    media_packet->buffer = std::make_shared<FFmpegPacketBuffer>(owned_packet);
-    media_packet->backend.type = BackendHandle::FFMPEG;
-    media_packet->backend.ptr = std::static_pointer_cast<FFmpegPacketBuffer>(media_packet->buffer)
-        ->GetPacket();
+    Media::BindAVPacket(*media_packet, std::move(packet_owner));
 
     return {
         std::nullopt,

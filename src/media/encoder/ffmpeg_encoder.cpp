@@ -3,7 +3,7 @@
 #include "media/converter/media_frame_converter.h"
 
 #include "common/log/logger.h"
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 #include "media/ffmpeg_format.h"
 
 #include <algorithm>
@@ -489,7 +489,7 @@ bool FFmpegEncoder::receivePackets(std::vector<PacketPtr>& packets) {
         }
 
         // 包装为 MediaPacket，保持 FFmpeg 后端引用
-        auto pkt_buffer = std::make_shared<FFmpegPacketBuffer>(pkt);
+        auto pkt_owner = Media::OwnAVPacket(pkt);
         auto media_packet = std::make_shared<MediaPacket>();
         media_packet->type = config_.media_type;
         media_packet->codec = config_.codec_type;
@@ -505,9 +505,7 @@ bool FFmpegEncoder::receivePackets(std::vector<PacketPtr>& packets) {
         media_packet->time_base = Rational{codec_ctx_->time_base.num,
                                            codec_ctx_->time_base.den};
         media_packet->keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-        media_packet->buffer = pkt_buffer;
-        media_packet->backend.type = BackendHandle::FFMPEG;
-        media_packet->backend.ptr = pkt_buffer->GetPacket();
+        Media::BindAVPacket(*media_packet, std::move(pkt_owner));
 
 #if ENCODE_STATS_ENABLE
         ++stats.encode_packets;

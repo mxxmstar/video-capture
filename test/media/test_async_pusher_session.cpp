@@ -1,4 +1,4 @@
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 #include "media/pusher/async_pusher_session.h"
 
 #include <atomic>
@@ -52,7 +52,7 @@ MediaPacket MakeVideoPacket(bool keyframe, int value) {
     packet.dts = value;
     packet.duration = 1;
     packet.time_base = {1, 25};
-    packet.buffer = std::make_shared<FFmpegPacketBuffer>(raw);
+    Media::BindAVPacket(packet, Media::OwnAVPacket(raw));
     packet.backend.type = BackendHandle::FFMPEG;
     packet.backend.ptr = raw;
     return packet;

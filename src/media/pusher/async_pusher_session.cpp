@@ -3,7 +3,7 @@
 #include <memory>
 #include <utility>
 
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 
 extern "C" {
 #include <libavcodec/packet.h>
@@ -42,8 +42,8 @@ std::optional<MediaPacket> AsyncPusherSession::shallowClonePacket(const MediaPac
         return std::nullopt;
     }
 
-    const auto* source = static_cast<const AVPacket*>(packet.backend.ptr);
-    if (!source->data || source->size <= 0 || (IsValidTimestamp(packet.duration) && packet.duration < 0)) {
+    const auto* source = Media::GetBackendPacket(packet);
+    if (!source || !source->data || source->size <= 0 || (IsValidTimestamp(packet.duration) && packet.duration < 0)) {
         error = makeError(PusherErrorCategory::InvalidPacket, "AsyncPusherSession received an invalid packet payload");
         return std::nullopt;
     }
@@ -55,9 +55,7 @@ std::optional<MediaPacket> AsyncPusherSession::shallowClonePacket(const MediaPac
     }
 
     MediaPacket owned = packet;
-    owned.buffer = std::make_shared<FFmpegPacketBuffer>(copy.release());
-    owned.backend.type = BackendHandle::FFMPEG;
-    owned.backend.ptr = static_cast<FFmpegPacketBuffer*>(owned.buffer.get())->GetPacket();
+    Media::BindAVPacket(owned, Media::OwnAVPacket(copy.release()));
     return owned;
 }
 

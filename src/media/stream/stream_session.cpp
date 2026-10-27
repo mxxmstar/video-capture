@@ -1,3 +1,4 @@
+#include "media/ffmpeg_packet_utils.h"
 #include "media/stream/stream_session.h"
 
 #include <algorithm>
@@ -565,8 +566,7 @@ bool MediaStreamSession::applyPullerTimestampPolicy(MediaPacket& packet) {
 
     // FFmpegDecoder 在 time_base 一致时会直接使用 backend.ptr 指向的
     // AVPacket，而不是重新读取 MediaPacket 的公共字段。两份表示必须同步。
-    if (packet.backend.type == BackendHandle::FFMPEG && packet.backend.ptr) {
-        auto* av_packet = static_cast<AVPacket*>(packet.backend.ptr);
+    if (auto* av_packet = const_cast<AVPacket*>(Media::GetBackendPacket(packet))) {
         av_packet->pts = IsValidTimestamp(packet.pts) ? packet.pts : AV_NOPTS_VALUE;
         av_packet->dts = IsValidTimestamp(packet.dts) ? packet.dts : AV_NOPTS_VALUE;
     }

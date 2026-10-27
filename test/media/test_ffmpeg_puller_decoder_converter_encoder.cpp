@@ -3,8 +3,8 @@
 #include "media/converter/media_frame_converter.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/publisher/publisher.h"
-#include "media/ffmpeg_raw_frame_buffer.h"
-#include "media/simple_buffer.h"
+#include "media/ffmpeg_frame_owner.h"
+#include "media/media_buffer.h"
 #include "common/log/logger.h"
 
 #include <algorithm>
@@ -281,13 +281,13 @@ int RunFfmpegConverterTest() {
     }
     std::fill(video_data.begin() + 16, video_data.begin() + 20, 90);
     std::fill(video_data.begin() + 20, video_data.end(), 160);
-    auto video_input_owner = std::make_shared<SimpleBuffer>(std::move(video_data));
-    const auto* video_bytes = video_input_owner->Data();
+    auto video_input_owner = std::make_shared<const std::vector<uint8_t>>(std::move(video_data));
+    const auto* video_bytes = video_input_owner->data();
     video_input->view = MediaBufferView::FromContiguous({
         {video_bytes, 16, PlaneGeometry{4, 4, 4}},
         {video_bytes + 16, 4, PlaneGeometry{2, 2, 2}},
         {video_bytes + 20, 4, PlaneGeometry{2, 2, 2}},
-    }, ConstBufferRegion{video_bytes, video_input_owner->Size()}, video_input_owner);
+    }, ConstBufferRegion{video_bytes, video_input_owner->size()}, video_input_owner);
 
     MediaFrameConverter video_converter;
     MediaFrameConverterConfig video_config{};
@@ -360,11 +360,11 @@ int RunFfmpegConverterTest() {
         // 使用递增波形即可，测试重点是格式转换链路，不是音频内容质量。
         audio_samples[i] = static_cast<int16_t>((i % 32) * 500);
     }
-    auto audio_input_owner = std::make_shared<SimpleBuffer>(std::move(audio_data));
-    const auto* audio_bytes = audio_input_owner->Data();
+    auto audio_input_owner = std::make_shared<const std::vector<uint8_t>>(std::move(audio_data));
+    const auto* audio_bytes = audio_input_owner->data();
     audio_input->view = MediaBufferView::FromContiguous({
         {audio_bytes, 320, PlaneGeometry{320, 320, 1}},
-    }, ConstBufferRegion{audio_bytes, audio_input_owner->Size()}, audio_input_owner);
+    }, ConstBufferRegion{audio_bytes, audio_input_owner->size()}, audio_input_owner);
 
     MediaFrameConverter audio_converter;
     MediaFrameConverterConfig audio_config{};

@@ -1,5 +1,5 @@
 #include "media/publisher/publisher.h"
-#include "media/ffmpeg_packet_buffer.h"
+#include "media/ffmpeg_packet_utils.h"
 
 #include <atomic>
 #include <chrono>
@@ -65,7 +65,7 @@ MediaPacket MakeEncodedVideoPacket(bool keyframe) {
     packet.dts = 0;
     packet.duration = 1;
     packet.time_base = {1, 25};
-    packet.buffer = std::make_shared<FFmpegPacketBuffer>(raw);
+    Media::BindAVPacket(packet, Media::OwnAVPacket(raw));
     packet.backend.type = BackendHandle::FFMPEG;
     packet.backend.ptr = raw;
     return packet;

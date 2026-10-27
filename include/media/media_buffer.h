@@ -200,7 +200,7 @@ public:
         if (has_contiguous_storage_) {
             return {{contiguous_storage_.data(), contiguous_storage_.size()}};
         }
-        std::vector<BufferRegion> regions;        
+        std::vector<BufferRegion> regions;
         regions.reserve(planes_.size());
         for (std::size_t i = 0; i < planes_.size(); ++i) {
             regions.push_back({Data(i), PlaneSize(i)});

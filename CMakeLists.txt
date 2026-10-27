@@ -65,7 +65,7 @@ endif()
 find_package(Threads REQUIRED)
 
 # 保留 packed 路径作为性能对照组；切换为 ON 时启用 raw AVFrame 路径。
-option(MEDIA_RAW_FRAME_BUFFER "Use non-copying raw AVFrame media buffers" OFF)
+option(MEDIA_RAW_FRAME_BUFFER "Retain AVFrame owners instead of copying decoded/converted frames" OFF)
 
 # FFmpeg 配置
 set(DEFAULT_FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg-8.1")

@@ -1,6 +1,7 @@
 #include "media/decoder/ffmpeg_decoder.h"
-#include "media/ffmpeg_frame_buffer.h"
-#include "media/ffmpeg_raw_frame_buffer.h"
+#include "media/ffmpeg_frame_owner.h"
+#include "media/ffmpeg_packet_utils.h"
+#include "media/converter/media_frame_converter.h"
 #include "media/ffmpeg_format.h"
 #include "media/ffmpeg_frame_view.h"
 #include "common/log/logger.h"
@@ -209,11 +210,11 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
     ++stats.decode_calls;
 #endif
     // FFmpegPuller 输出的 packet 已经持有 AVPacket，可以直接复用。
-    // AVTP/RTP 等输入通常只持有普通 IMediaBuffer，这里临时包装成 AVPacket。
-    AVPacket* avpkt = nullptr;
+    // AVTP/RTP 等输入通常只持有普通 MediaPacketBuffer，这里临时包装成 AVPacket。
+    const AVPacket* avpkt = nullptr;
     AVPacket* temporary_packet = nullptr;
     if (packet->backend.type == BackendHandle::FFMPEG) {
-        avpkt = static_cast<AVPacket*>(packet->backend.ptr);
+        avpkt = Media::GetBackendPacket(*packet);
         if (!avpkt) {
 #if DECODE_STATS_ENABLE    
             ++stats.decode_errors;
@@ -332,236 +333,49 @@ void FFmpegDecoder::SetFrameCallback(FrameCallback cb) {
     frame_cb_ = std::move(cb);
 }
 
-#if !RAW_FRAME_BUFFER
 bool FFmpegDecoder::receiveFrames() {
-    if (!codec_ctx_)
-        return false;
-
-    int ret = 0;
-    // TODO: 优化内存分配，避免频繁分配释放释放 frame
-    // puller 中已经进行了探测，可以根据探测结果进行内存池初始化
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) {
-        LOG_ERROR("av_frame_alloc failed");
-        return false;
-    }
-
-    while (ret >= 0) {
-        ret = avcodec_receive_frame(codec_ctx_, frame);
-
-        if (ret == AVERROR(EAGAIN)) {
-            // 解码器需要更多数据，正常
-            break;
+    if (!codec_ctx_) return false;
+    for (;;) {
+        std::unique_ptr<AVFrame, Media::AVFrameDeleter> decoded(av_frame_alloc());
+        if (!decoded) {
+            LOG_ERROR("av_frame_alloc failed");
+            return false;
         }
-        if (ret == AVERROR_EOF) {
-            LOG_DEBUG("EOF");
-            break;
-        }
+        const int ret = avcodec_receive_frame(codec_ctx_, decoded.get());
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
         if (ret < 0) {
-            char buf[AV_ERROR_MAX_STRING_SIZE];
-            av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
-            LOG_ERROR("avcodec_receive_frame failed: {}", buf);
-            av_frame_free(&frame);
+            char error[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(error, sizeof(error), ret);
+            LOG_ERROR("avcodec_receive_frame failed: {}", error);
             return false;
         }
-
-        // 构建 FFmpegFrameBuffer（接管 frame 所有权）
-        int size = 0;
-        if (stream_info_.media_type == MediaType::VIDEO) {
-            size = av_image_get_buffer_size(
-                static_cast<AVPixelFormat>(frame->format),
-                frame->width, frame->height, 1);
-        }
-        else if (stream_info_.media_type == MediaType::AUDIO) {
-            size = av_samples_get_buffer_size(
-                nullptr,
-                frame->ch_layout.nb_channels,
-                frame->nb_samples,
-                static_cast<AVSampleFormat>(frame->format),
-                1);
-        }
-
-        if (size <= 0) {
-            LOG_ERROR("get buffer size failed");
-            av_frame_free(&frame);
-            return false;
-        }
-#if DECODE_STATS_ENABLE    
-        ++stats.decode_frames;
-#endif        
-        auto fb = std::make_shared<FFmpegFrameBuffer>(frame, static_cast<size_t>(size));
-
-        // 上面已经将frame的所有权转移给了fb,这里需要重新分配新 frame
-        frame = av_frame_alloc();
-        if (!frame) {
-            LOG_ERROR("av_frame_alloc OOM after decode");
-            av_frame_free(&frame);
-            return false;
-        }
-
-        // 填充 MediaFrame
-        auto mf = std::make_shared<MediaFrame>();
-        const AVFrame* decoded_frame = fb->GetFrame();
-        const AVRational frame_time_base = FrameTimeBase(decoded_frame, stream_info_);
-        mf->time.pts_us = TimestampToUs(FramePts(decoded_frame), frame_time_base);
-        mf->time.dts_us = TimestampToUs(decoded_frame->pkt_dts, frame_time_base);
-        mf->time.duration_us = TimestampToUs(decoded_frame->duration, frame_time_base);
-        mf->view = MakeFFmpegFrameView(*decoded_frame, std::shared_ptr<const AVFrame>(fb, decoded_frame));
-        mf->backend.type = BackendHandle::FFMPEG;
-        mf->backend.ptr = fb->GetFrame();
-
-        if (stream_info_.media_type == MediaType::VIDEO) {
-            mf->type = MediaType::VIDEO;
-            VideoFrameMeta video_meta;
-            const auto av_pix_fmt = static_cast<AVPixelFormat>(fb->GetFrame()->format);
-            video_meta.pixel_format = FromAVPixelFormat(av_pix_fmt);
-            video_meta.width = fb->GetFrame()->width;
-            video_meta.height = fb->GetFrame()->height;
-            mf->meta = video_meta;
-        }
-        else if (stream_info_.media_type == MediaType::AUDIO) {
-            mf->type = MediaType::AUDIO;
-            AudioFrameMeta audio_meta;
-            const auto av_sample_fmt = static_cast<AVSampleFormat>(fb->GetFrame()->format);
-            audio_meta.sample_format = FromAVSampleFormat(av_sample_fmt);
-            audio_meta.sample_rate = fb->GetFrame()->sample_rate;
-            audio_meta.channels = fb->GetFrame()->ch_layout.nb_channels;
-            audio_meta.channel_layout = fb->GetFrame()->ch_layout.u.mask;
-            audio_meta.nb_samples = fb->GetFrame()->nb_samples;
-            audio_meta.bytes_per_sample = av_get_bytes_per_sample(av_sample_fmt);
-            audio_meta.planar = av_sample_fmt_is_planar(av_sample_fmt) != 0;
-            mf->meta = audio_meta;
-        }
-
-        // 回调通知
-        FrameCallback cb;
-        {
-            std::lock_guard<std::mutex> lock(cb_mutex_);
-            cb = frame_cb_;
-        }
-        if (cb) {
-            cb(std::move(mf));
-        }
-    }
-
-    av_frame_free(&frame);
-    return true;
-}
-
+        const AVRational time_base = FrameTimeBase(decoded.get(), stream_info_);
+        const MediaTime time{
+            TimestampToUs(FramePts(decoded.get()), time_base),
+            TimestampToUs(decoded->pkt_dts, time_base),
+            TimestampToUs(decoded->duration, time_base)};
+        std::shared_ptr<MediaFrame> frame;
+#if RAW_FRAME_BUFFER
+        if (!MediaFrameConverter::AdoptAVFrame(decoded.release(), frame)) {
 #else
-
-bool FFmpegDecoder::receiveFrames() {
-    if (!codec_ctx_)
-        return false;
-
-    int ret = 0;
-    // TODO: 优化内存分配，避免频繁分配释放释放 frame
-    // puller 中已经进行了探测，可以根据探测结果进行内存池初始化
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) {
-        LOG_ERROR("av_frame_alloc failed");
-        return false;
-    }
-
-    while (ret >= 0) {
-        ret = avcodec_receive_frame(codec_ctx_, frame);
-
-        if (ret == AVERROR(EAGAIN)) {
-            // 解码器需要更多数据，正常
-            break;
-        }
-        if (ret == AVERROR_EOF) {
-            LOG_DEBUG("EOF");
-            break;
-        }
-        if (ret < 0) {
-            char buf[AV_ERROR_MAX_STRING_SIZE];
-            av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
-            LOG_ERROR("avcodec_receive_frame failed: {}", buf);
-            av_frame_free(&frame);
+        frame = std::make_shared<MediaFrame>();
+        if (!MediaFrameConverter::AvFrameToMediaFrame(*decoded, frame.get())) {
+#endif
+            LOG_ERROR("Decoded frame conversion failed: {}", MediaFrameConverter::LastError());
             return false;
         }
-        
-        // avcodec_receive_frame() 得到的 AVFrame 不能直接在下一次 receive
-        // 后继续借用，因为解码器会复用 frame 描述符。这里把描述符的所有权
-        // 转移给 FFmpegRawFrameBuffer；它只持有 AVFrame，不把多平面数据重新
-        // 打包为连续内存。后续 converter/encoder 通过 backend.ptr 对它执行
-        // av_frame_ref()，因此解码后的像素数据不再发生额外拷贝。
-
-        // 在 make_shared 完成前仍由局部 RAII 所有者持有 frame，避免对象
-        // 分配或构造抛出异常时泄漏从 avcodec_receive_frame() 得到的资源。
-        const auto frame_deleter = [](AVFrame* owned) {
-            av_frame_free(&owned);
-        };
-        std::unique_ptr<AVFrame, decltype(frame_deleter)> owned_frame(frame, frame_deleter);
-        auto fb = std::make_shared<FFmpegRawFrameBuffer>(owned_frame.get());
-        if (!fb->IsValid()) {
-            LOG_ERROR("decoded AVFrame is not a valid raw media frame");
-            return false;
-        }
-        owned_frame.release();
-
-        // frame 的所有权已移交给 fb。为接收下一帧重新分配描述符，避免本次
-        // 回调持有的 MediaFrame 与下一次 avcodec_receive_frame() 相互覆盖。
-        frame = av_frame_alloc();
-        if (!frame) {
-            LOG_ERROR("av_frame_alloc OOM after decode");
-            return false;
-        }
-
+        frame->time = time;
 #if DECODE_STATS_ENABLE
         ++stats.decode_frames;
 #endif
-
-        // 填充 MediaFrame
-        auto mf = std::make_shared<MediaFrame>();
-        const AVFrame* decoded_frame = fb->GetFrame();
-        const AVRational frame_time_base = FrameTimeBase(decoded_frame, stream_info_);
-        mf->time.pts_us = TimestampToUs(FramePts(decoded_frame), frame_time_base);
-        mf->time.dts_us = TimestampToUs(decoded_frame->pkt_dts, frame_time_base);
-        mf->time.duration_us = TimestampToUs(decoded_frame->duration, frame_time_base);
-        mf->view = MakeFFmpegFrameView(*decoded_frame, std::shared_ptr<const AVFrame>(fb, decoded_frame));
-        mf->backend.type = BackendHandle::FFMPEG;
-        mf->backend.ptr = fb->GetFrame();
-
-        if (stream_info_.media_type == MediaType::VIDEO) {
-            mf->type = MediaType::VIDEO;
-            VideoFrameMeta video_meta;
-            const auto av_pix_fmt = static_cast<AVPixelFormat>(fb->GetFrame()->format);
-            video_meta.pixel_format = FromAVPixelFormat(av_pix_fmt);
-            video_meta.width = fb->GetFrame()->width;
-            video_meta.height = fb->GetFrame()->height;
-            mf->meta = video_meta;
-        }
-        else if (stream_info_.media_type == MediaType::AUDIO) {
-            mf->type = MediaType::AUDIO;
-            AudioFrameMeta audio_meta;
-            const auto av_sample_fmt = static_cast<AVSampleFormat>(fb->GetFrame()->format);
-            audio_meta.sample_format = FromAVSampleFormat(av_sample_fmt);
-            audio_meta.sample_rate = fb->GetFrame()->sample_rate;
-            audio_meta.channels = fb->GetFrame()->ch_layout.nb_channels;
-            audio_meta.channel_layout = fb->GetFrame()->ch_layout.u.mask;
-            audio_meta.nb_samples = fb->GetFrame()->nb_samples;
-            audio_meta.bytes_per_sample = av_get_bytes_per_sample(av_sample_fmt);
-            audio_meta.planar = av_sample_fmt_is_planar(av_sample_fmt) != 0;
-            mf->meta = audio_meta;
-        }
-
-        // 回调通知
-        FrameCallback cb;
+        FrameCallback callback;
         {
             std::lock_guard<std::mutex> lock(cb_mutex_);
-            cb = frame_cb_;
+            callback = frame_cb_;
         }
-        if (cb) {
-            cb(std::move(mf));
-        }
+        if (callback) callback(std::move(frame));
     }
-
-    av_frame_free(&frame);
-    return true;
 }
-#endif
 #if DECODE_STATS_ENABLE    
 void FFmpegDecoder::PrintStats() const {
     uint64_t avg_decode_time = stats.decode_frames > 0 
