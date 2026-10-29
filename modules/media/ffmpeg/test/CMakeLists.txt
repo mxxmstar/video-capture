@@ -1,0 +1,4 @@
+add_executable(test_media_raw_frame_contract test_raw_frame_contract.cpp)
+target_link_libraries(test_media_raw_frame_contract PRIVATE media_ffmpeg)
+copy_runtime_dependencies(test_media_raw_frame_contract)
+add_test(NAME test_media_raw_frame_contract COMMAND test_media_raw_frame_contract)

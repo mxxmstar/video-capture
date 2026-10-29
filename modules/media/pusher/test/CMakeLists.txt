@@ -1,0 +1,3 @@
+media_test(test_async_pusher_session media_pusher_session)
+media_test(test_ffmpeg_pusher Media::Output)
+media_test(test_pusher_session media_pusher_session)

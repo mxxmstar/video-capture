@@ -1,0 +1,2 @@
+media_test(test_media_stream_session_reconnect Media::Pipeline)
+media_test(test_media_stream_session_scripted Media::Pipeline media_ffmpeg)

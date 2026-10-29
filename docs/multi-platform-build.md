@@ -13,7 +13,7 @@ src/common/process/rockchip/process.cpp   # 无 Boost 的 POSIX 进程实现
 platform/rockchip/setup.cmake         # ARM64 工具链选择
 platform/rockchip/CMakeLists.txt      # MPP / RGA / spdlog / FFmpeg，无 Boost
 src/common/CMakeLists.txt             # 公共目标与所选进程后端
-src/media/CMakeLists.txt              # 媒体源码
+modules/media/CMakeLists.txt              # 媒体源码
 ```
 
 `EMBEDDED_PLATFORM=generic|rockchip`，默认 generic；不支持的值明确报错。

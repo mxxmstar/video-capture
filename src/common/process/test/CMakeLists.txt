@@ -1,0 +1,6 @@
+if(EMBEDDED_PLATFORM STREQUAL "rockchip")
+    add_executable(test_process test_posix_process.cpp)
+    target_link_libraries(test_process PRIVATE common_lib)
+    add_test(NAME test_process COMMAND test_process)
+    set_tests_properties(test_process PROPERTIES TIMEOUT 20)
+endif()

@@ -1,0 +1,5 @@
+media_module(media_output src/generic/ffmpeg_pusher.cpp src/generic/ffmpeg_muxer.cpp src/generic/pusher_factory.cpp)
+target_link_libraries(media_output PUBLIC media_ffmpeg media_diagnostics)
+add_library(Media::Output ALIAS media_output)
+media_module(media_pusher_session src/pusher_session.cpp src/async_pusher_session.cpp)
+target_link_libraries(media_pusher_session PUBLIC media_output Threads::Threads)

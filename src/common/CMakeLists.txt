@@ -8,3 +8,7 @@ target_compile_options(common_lib PRIVATE
 if(MSVC)
     target_compile_options(common_lib PUBLIC /utf-8 /Zc:__cplusplus)
 endif()
+
+if(BUILD_TESTS)
+    add_subdirectory(process/test)
+endif()
