@@ -5,7 +5,6 @@
 #include "media/media_packet_buffer.h"
 #include "media/stream/stream_session.h"
 
-#include <boost/asio/io_context.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -377,8 +376,7 @@ bool RunReconnectSuccessTest() {
             "reconnected input ended"),
     });
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true, true}, std::move(scripts)));
 
@@ -432,8 +430,7 @@ bool RunReconnectExhaustedTest() {
             "connection lost permanently"),
     });
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true, false, false}, std::move(scripts)));
 
@@ -493,8 +490,7 @@ bool RunExponentialBackoffTest() {
     });
 
     const auto open_history = std::make_shared<OpenHistory>();
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true, false, true},
         std::move(scripts),
@@ -558,8 +554,7 @@ bool RunStopDuringBackoffTest() {
             "stop during backoff"),
     });
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true}, std::move(scripts)));
 
@@ -636,8 +631,7 @@ bool RunStableResetTest() {
             "stable reset input ended"),
     });
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true, true, true}, std::move(scripts)));
 
@@ -701,8 +695,7 @@ bool RunTimestampReconnectScopeTest(PullerTimestampEpochScope scope,
             "timestamp reconnect complete"),
     });
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ReconnectPuller>(
         std::vector<bool>{true, true}, std::move(scripts)));
 

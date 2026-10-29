@@ -12,7 +12,6 @@
 #include <string>
 #include <thread>
 
-#include <boost/asio/io_context.hpp>
 
 #include "media/media_packet.h"
 #include "media/puller/i_puller.h"
@@ -25,7 +24,6 @@
 ///
 /// 管理一次拉流连接的生命周期，职责包括：
 ///   - 连接 / 断开 / 自动重连
-///   - 读循环（通过 boost::asio::post 调度到 io_context）
 ///   - Watchdog 读超时检测（steady_timer）
 ///   - 码率统计（原子计数器 + 定时汇总）
 ///
@@ -33,8 +31,7 @@
 /// 自身不持有解码器 / pipeline / sink。
 /// 时间轴策略在这里作用于 Puller 交付的 packet；Puller 本身只保留源时间戳。
 ///
-/// 不持有线程 —— ReadLoop 被 post 到构造时传入的 io_context 上，
-/// 由外部线程池或 io_context::run() 驱动。方便配合线程池 / io_context 池统一管理。
+/// ReadLoop is driven by an owned std::thread; Stop() joins it.
 class MediaStreamSession : public std::enable_shared_from_this<MediaStreamSession> {
 public:
     enum class State {
@@ -54,7 +51,7 @@ public:
         uint32_t reconnect_count{0};  ///< 累计重连尝试次数
     };
 
-    explicit MediaStreamSession(boost::asio::io_context& io);
+    MediaStreamSession();
     ~MediaStreamSession();
 
     bool Start();
@@ -120,7 +117,6 @@ private:
         Rational last_epoch_time_base{1, 1};
     };
 
-    boost::asio::io_context& io_;   ///< 异步 I/O 上下文，用于调度 ReadLoop
     std::unique_ptr<IPuller> puller_; ///< 拉流器，负责从服务器拉取数据
     InputEndpointConfig endpoint_;   ///< 输入端点配置，包含 URL、端口、用户名、密码等
     SessionConfig session_config_;   ///< 会话配置，包含重连间隔、最大重连次数、Jitter Buffer 配置等

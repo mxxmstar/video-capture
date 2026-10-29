@@ -64,7 +64,7 @@ bool CanAddTimestamp(std::int64_t value, std::int64_t offset) {
 
 }  // namespace
 
-MediaStreamSession::MediaStreamSession(boost::asio::io_context& io) : io_(io) {
+MediaStreamSession::MediaStreamSession() {
 }
 
 MediaStreamSession::~MediaStreamSession() {

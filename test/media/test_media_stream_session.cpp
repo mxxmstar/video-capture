@@ -4,7 +4,6 @@
 #include "media/puller/ffmpeg_puller.h"
 #include "media/stream/stream_session.h"
 
-#include <boost/asio/io_context.hpp>
 
 #include <chrono>
 #include <condition_variable>
@@ -33,8 +32,7 @@ int RunSessionTest() {
     endpoint.uri = kRtspUri;
     endpoint.puller_kind = PullerKind::FFmpeg;
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<FFmpegPuller>(std::move(puller_config)));
     session->SetEndpoint(endpoint);
 

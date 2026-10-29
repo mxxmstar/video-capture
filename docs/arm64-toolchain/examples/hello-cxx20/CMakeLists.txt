@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(hello_arm64_cxx20 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+add_executable(hello_arm64 main.cpp)
+target_compile_options(hello_arm64 PRIVATE -Wall -Wextra -Wpedantic)

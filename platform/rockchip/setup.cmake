@@ -1,0 +1,5 @@
+set(EMBEDDED_DEFAULT_BUILD_RENDER OFF)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/toolchains/nanopc-t4-gcc12.cmake"
+        CACHE FILEPATH "Rockchip cross-compilation toolchain")
+endif()

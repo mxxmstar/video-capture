@@ -6,7 +6,6 @@
 #include "media/media_packet_buffer.h"
 #include "media/stream/stream_session.h"
 
-#include <boost/asio/io_context.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -291,9 +290,7 @@ bool RunCase(const TestCase& test_case) {
     }
 
     // MediaStreamSession 当前的读取循环使用独立线程，因此这里不需要
-    // 调用 io.run()；io_context 只是满足 Session 的构造接口。
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ScriptedPuller>(std::move(results)));
 
     // ScriptedPuller 不关心 puller_kind，但 Session 仍要求 endpoint 有
@@ -421,8 +418,7 @@ bool RunTimestampPolicyTest() {
         false,
         "timestamp policy test complete"));
 
-    boost::asio::io_context io;
-    auto session = std::make_shared<MediaStreamSession>(io);
+    auto session = std::make_shared<MediaStreamSession>();
     session->SetPuller(std::make_unique<ScriptedPuller>(std::move(results)));
 
     InputEndpointConfig endpoint;
