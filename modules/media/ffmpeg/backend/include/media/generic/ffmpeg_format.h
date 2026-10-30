@@ -79,6 +79,9 @@ inline AVCodecID ToAVCodecID(CodecType type) {
         case CodecType::H265: return AV_CODEC_ID_HEVC;
         case CodecType::AAC:  return AV_CODEC_ID_AAC;
         case CodecType::OPUS: return AV_CODEC_ID_OPUS;
+        case CodecType::G711A: return AV_CODEC_ID_PCM_ALAW;
+        case CodecType::G711U: return AV_CODEC_ID_PCM_MULAW;
+        case CodecType::G726: return AV_CODEC_ID_ADPCM_G726;
         default:               return AV_CODEC_ID_NONE;
     }
 }

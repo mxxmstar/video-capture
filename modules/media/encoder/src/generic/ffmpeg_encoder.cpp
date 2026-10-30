@@ -126,12 +126,6 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
             LOG_ERROR("Invalid audio sample format {}", static_cast<int>(cfg.audio().sample_format));
             return false;
         }
-        if (sample_fmt == AV_SAMPLE_FMT_NONE) {
-            LOG_WARN("audio encoder not found for codec={}, name={}, fmt={}",
-                              static_cast<int>(codec_id), cfg.encoder_name,
-                              static_cast<int>(sample_fmt));
-            return false;
-        }
         codec = findAudioEncoder(codec_id, sample_fmt, cfg.encoder_name, encoder_sample_fmt);
         if (codec == nullptr) {
             LOG_WARN("audio encoder not found for codec={}, name={}, fmt={}",
@@ -196,6 +190,11 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
             av_channel_layout_default(&codec_ctx_->ch_layout, cfg.audio().channels);
         }
         codec_ctx_->sample_fmt = encoder_sample_fmt;
+        if (!av_channel_layout_check(&codec_ctx_->ch_layout) || codec_ctx_->ch_layout.nb_channels != cfg.audio().channels) {
+            LOG_ERROR("Audio channel layout does not match configured channels");
+            avcodec_free_context(&codec_ctx_);
+            return false;
+        }
     }
 
     // 打开编码器
@@ -212,19 +211,27 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
     MediaFrameConverterConfig frame_converter_config;
 
     if (cfg.media_type == MediaType::VIDEO) {
-        frame_converter_config.video.width = cfg.video().width;
-        frame_converter_config.video.height = cfg.video().height;
+        frame_converter_config.video.width = codec_ctx_->width;
+        frame_converter_config.video.height = codec_ctx_->height;
         frame_converter_config.video.sws_flags = cfg.video().sws_flags;
-        frame_converter_config.video.pixel_format = cfg.video().pixel_format;
+        frame_converter_config.video.pixel_format = FromAVPixelFormat(codec_ctx_->pix_fmt);
     } else {
-        frame_converter_config.audio.sample_rate = cfg.audio().sample_rate;
-        frame_converter_config.audio.channels = cfg.audio().channels;
-        frame_converter_config.audio.channel_layout = cfg.audio().channel_layout;
-        frame_converter_config.audio.sample_format = cfg.audio().sample_format;
+        frame_converter_config.audio.sample_rate = codec_ctx_->sample_rate;
+        frame_converter_config.audio.channels = codec_ctx_->ch_layout.nb_channels;
+        frame_converter_config.audio.channel_layout = codec_ctx_->ch_layout.u.mask;
+        frame_converter_config.audio.sample_format = FromAVSampleFormat(codec_ctx_->sample_fmt);
+        audio_fifo_ = av_audio_fifo_alloc(codec_ctx_->sample_fmt,
+            codec_ctx_->ch_layout.nb_channels, std::max(codec_ctx_->frame_size, 1));
+        if (!audio_fifo_) {
+            LOG_ERROR("Failed to allocate audio FIFO");
+            Close();
+            return false;
+        }
     }
 
     if (!converter_->Open(frame_converter_config)) {
         LOG_ERROR("Failed to open frame converter: {}", MediaFrameConverter::LastError());
+        Close();
         return false;
     }
 
@@ -234,16 +241,14 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
                          codec->name ? codec->name : "<unknown>",
                          cfg.video().width, cfg.video().height, cfg.video().fps_num, cfg.video().fps_den,
                          static_cast<int>(cfg.video().pixel_format),
-                         "todo"
-                         /*static_cast<int>(encoder_pix_fmt_)*/);
+                         static_cast<int>(codec_ctx_->pix_fmt));
     } else {
         LOG_INFO("Open audio encoder success: codec={}, encoder={}, rate={}, ch={}, input_fmt={}, encoder_fmt={}",
                          static_cast<int>(cfg.codec_type),
                          codec->name ? codec->name : "<unknown>",
                          cfg.audio().sample_rate, cfg.audio().channels,
                          static_cast<int>(cfg.audio().sample_format),
-                         "todo"
-                         /*static_cast<int>(encoder_sample_fmt_)*/);
+                         static_cast<int>(codec_ctx_->sample_fmt));
     }
 
     return true;
@@ -281,13 +286,15 @@ EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
     info.time_base = {codec_ctx_->time_base.num, codec_ctx_->time_base.den};
 
     if (config_.is_video()) {
+        info.specific = VideoTrackInfo{};
         info.video().width = codec_ctx_->width;
         info.video().height = codec_ctx_->height;
+        info.video().pixel_format = FromAVPixelFormat(codec_ctx_->pix_fmt);
         if (codec_ctx_->framerate.den > 0 && codec_ctx_->framerate.num > 0) {
-            info.video().fps = static_cast<float>(codec_ctx_->framerate.num) /
-                       static_cast<float>(codec_ctx_->framerate.den);
+            info.video().fps = static_cast<float>(codec_ctx_->framerate.num) / static_cast<float>(codec_ctx_->framerate.den);
         }
     } else if (config_.is_audio()) {
+        info.specific = AudioTrackInfo{};
         info.audio().sample_rate = codec_ctx_->sample_rate;
         info.audio().channels = codec_ctx_->ch_layout.nb_channels;
     }
@@ -301,6 +308,14 @@ EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
 }
 
 void FFmpegEncoder::Close() {
+    if (audio_fifo_) {
+        av_audio_fifo_free(audio_fifo_);
+        audio_fifo_ = nullptr;
+    }
+    audio_start_pts_ = 0;
+    audio_samples_sent_ = 0;
+    audio_pts_initialized_ = false;
+    audio_flushed_ = false;
     if (codec_ctx_) {
         avcodec_free_context(&codec_ctx_);
         codec_ctx_ = nullptr;
@@ -360,7 +375,13 @@ bool FFmpegEncoder::encodeVideoFrame(FramePtr frame, std::vector<PacketPtr>& pac
         return false;
     }
 
-    bool ok = converter_->MediaFrameToAVFrame(*frame, input);
+    FramePtr converted = frame;
+    if (ToAVPixelFormat(frame->PixelFormat()) != codec_ctx_->pix_fmt && !converter_->Convert(*frame, converted)) {
+        LOG_WARN("Video conversion failed: {}", converter_->LastError());
+        av_frame_free(&input);
+        return false;
+    }
+    bool ok = converter_->MediaFrameToAVFrame(*converted, input);
     if (!ok) {
         LOG_WARN("MediaFrameToAVFrame failed: {}", converter_->LastError());
         av_frame_free(&input);
@@ -420,30 +441,111 @@ bool FFmpegEncoder::encodeVideoFrame(FramePtr frame, std::vector<PacketPtr>& pac
 }
 
 bool FFmpegEncoder::encodeAudioFrame(FramePtr frame, std::vector<PacketPtr>& packets) {
-    // 判断编码器是否需要固定帧大小
-    //      frame_size        可变帧大小
-    // AAC	   1024	        必须固定 1024 样本
-    // MP3	   1152	        必须固定 1152 样本
-    // PCM	   0	        任意大小
-    // Opus	   960	        支持可变大小
-    // const bool fixed_frame_size = codec_ctx_->fixed_frame_size > 0 &&
-    //     (!codec_ctx_->codec ||
-    //      (codec_ctx_->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) == 0);
+    if (audio_flushed_) {
+        return !frame;
+    }
+    if (!frame) {
+        // 从 fifo 中读取数据，发送到编码器
+        if (!drainAudioFifo(true, packets) || !sendFrameToEncoder(nullptr, packets)) {
+            return false;
+        }
+        audio_flushed_ = true;
+        return true;
+    }
 
-    // // 可变帧大小，直接送到编码器中，不需要fifo缓冲
-    // if (!fixed_frame_size) {
-    //     if (!frame) {
-    //         return sendFrameToEncoder(nullptr, packets);
-    //     }
-    //     AVFrame* input = buildInputFrame(frame);
-    //     if (!input) {
-    //         return false;
-    //     }
-    //     const bool ok = sendFrameToEncoder(input, packets);
-    //     av_frame_free(&input);
-    //     return ok;
-    // }
+    const auto* meta = std::get_if<AudioFrameMeta>(&frame->meta);
+    // 拒绝采样率/声道数不匹配的音频帧，因为这个转换中swr需要缓存后面的样本才能进行采样率转换
+    // 当前 EOS 只会排空 fifo 中的数据，不会将 swr 中的缓存的样本发送到编码器
+    if (frame->type != MediaType::AUDIO || !meta || meta->nb_samples <= 0 ||
+        meta->sample_rate != config_.audio().sample_rate ||
+        meta->channels != config_.audio().channels ||
+        meta->sample_format != config_.audio().sample_format ||
+        (meta->channel_layout != 0 && meta->channel_layout != codec_ctx_->ch_layout.u.mask)) {
+        LOG_WARN("Audio frame does not match encoder input configuration");
+        return false;
+    }
 
+    FramePtr converted;
+    if (!converter_->Convert(*frame, converted) || !converted) {
+        LOG_WARN("Audio conversion failed: {}", MediaFrameConverter::LastError());
+        return false;
+    }
+    AVFrame* input = av_frame_alloc();
+    if (!input) {
+        return false;
+    }
+    if (!MediaFrameConverter::MediaFrameToAVFrame(*converted, input)) {
+        LOG_WARN("Audio AVFrame conversion failed: {}", MediaFrameConverter::LastError());
+        av_frame_free(&input);
+        return false;
+    }
+    const int samples = input->nb_samples;
+    const int written = av_audio_fifo_write(audio_fifo_, reinterpret_cast<void**>(input->extended_data), samples);
+    av_frame_free(&input);
+    if (written != samples) {
+        LOG_ERROR("Failed to write audio samples to FIFO: {}", written);
+        return false;
+    }
+
+    // 锚定音频 pts 开始值
+    if (!audio_pts_initialized_) {
+        audio_start_pts_ = IsValidTimestamp(frame->time.pts_us)
+            ? av_rescale_q(frame->time.pts_us, kMicrosecondTimeBase, codec_ctx_->time_base) : 0;
+        audio_pts_initialized_ = true;
+    }
+    return drainAudioFifo(false, packets);  // 后续 pts 由已发送样本数计算
+}
+
+bool FFmpegEncoder::drainAudioFifo(bool flush, std::vector<PacketPtr>& packets) {
+    const int frame_size = codec_ctx_->frame_size;  // 编码器要求的音频样本数
+    const int capabilities = codec_ctx_->codec->capabilities;
+    // 攒数据
+    while (av_audio_fifo_size(audio_fifo_) > 0) {
+        const int available = av_audio_fifo_size(audio_fifo_);
+        if (!flush && frame_size > 0 && available < frame_size) {
+            break;
+        }
+        // 计算输出样本数
+        const int samples = frame_size > 0 ? std::min(available, frame_size) : available;
+        const bool pad = frame_size > samples && !(capabilities & (AV_CODEC_CAP_SMALL_LAST_FRAME | AV_CODEC_CAP_VARIABLE_FRAME_SIZE));
+        const int output_samples = pad ? frame_size : samples;
+        AVFrame* output = av_frame_alloc();
+        if (!output) {
+            return false;
+        }
+        output->format = codec_ctx_->sample_fmt;
+        output->sample_rate = codec_ctx_->sample_rate;
+        output->nb_samples = output_samples;
+        int ret = av_channel_layout_copy(&output->ch_layout, &codec_ctx_->ch_layout);
+        if (ret >= 0) {
+            ret = av_frame_get_buffer(output, 0);
+        }
+        if (ret >= 0 && pad) {
+            ret = av_samples_set_silence(output->extended_data, 0, output_samples,
+                codec_ctx_->ch_layout.nb_channels, codec_ctx_->sample_fmt);
+        }
+        if (ret < 0 || av_audio_fifo_peek(audio_fifo_, reinterpret_cast<void**>(output->extended_data), samples) != samples) {
+            LOG_ERROR("Failed to prepare audio encoder frame");
+            av_frame_free(&output);
+            return false;
+        }
+        // 使用累积样本数计算 pts 增长，避免时间基转换导致的 pts 偏移问题
+        const AVRational sample_time_base{1, codec_ctx_->sample_rate};
+        const int64_t position = av_rescale_q(audio_samples_sent_, sample_time_base, codec_ctx_->time_base);
+        output->pts = audio_start_pts_ + position;
+        output->time_base = codec_ctx_->time_base;
+        output->duration = av_rescale_q(audio_samples_sent_ + output_samples, sample_time_base, codec_ctx_->time_base) - position;
+        const bool ok = sendFrameToEncoder(output, packets);
+        av_frame_free(&output);
+        if (!ok) {
+            return false;
+        }
+        av_audio_fifo_drain(audio_fifo_, samples);
+        audio_samples_sent_ += output_samples;
+#if ENCODE_STATS_ENABLE
+        ++stats.encode_frames;
+#endif
+    }
     return true;
 }
 
@@ -455,6 +557,9 @@ bool FFmpegEncoder::sendFrameToEncoder(AVFrame* frame, std::vector<PacketPtr>& p
             return false;
         }
         ret = avcodec_send_frame(codec_ctx_, frame);
+    }
+    if (ret == AVERROR_EOF && !frame) {
+        return receivePackets(packets);
     }
     if (ret < 0) {
         LOG_WARN("FFmpegEncoder:SendFrameToEncoder: avcodec_send_frame failed: {}",

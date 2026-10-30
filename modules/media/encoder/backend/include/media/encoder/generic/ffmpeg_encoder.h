@@ -7,6 +7,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
 }
+struct AVAudioFifo;
 class MediaFrameConverter;
 class FFmpegEncoder : public IEncoder {
 public:
@@ -88,6 +89,18 @@ private:
 
     /// @brief 将微秒 pts 换算到编码器时间基；缺失时自动分配递增 pts
     int64_t resolveFramePts(const MediaFrame& frame);
+
+    /// @brief 打包 fifo 中的音频数据，凑成编码器需要的格式
+    /// @param flush 是否刷新（flush）音频 fifo，true: 不足一帧数据也打包；false: 等待写入样本，打包一帧数据
+    /// @param packets 输出 packet 列表
+    /// @return 是否成功
+    bool drainAudioFifo(bool flush, std::vector<PacketPtr>& packets);
+
+    AVAudioFifo* audio_fifo_ = nullptr;  ///< 音频 fifo，用来缓存音频数据
+    int64_t audio_start_pts_ = 0;       ///< 音频 pts 开始值，用来计算 pts 增长
+    int64_t audio_samples_sent_ = 0;     ///< 已发送音频样本数，用来计算 pts 增长
+    bool audio_pts_initialized_ = false;  ///< 是否初始化音频 pts 开始值
+    bool audio_flushed_ = false;         ///<  flush 编码器标志
 
     EncoderConfig config_;  ///< 编码器配置
     AVCodecContext* codec_ctx_ = nullptr;  ///< 编码器上下文
