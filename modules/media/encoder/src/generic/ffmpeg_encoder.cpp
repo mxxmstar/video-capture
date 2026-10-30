@@ -288,8 +288,7 @@ EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
     if (config_.is_video()) {
         info.specific = VideoTrackInfo{};
         info.video().width = codec_ctx_->width;
-        info.video().height = codec_ctx_->height;
-        info.video().pixel_format = FromAVPixelFormat(codec_ctx_->pix_fmt);
+        info.video().height = codec_ctx_->height;        
         if (codec_ctx_->framerate.den > 0 && codec_ctx_->framerate.num > 0) {
             info.video().fps = static_cast<float>(codec_ctx_->framerate.num) / static_cast<float>(codec_ctx_->framerate.den);
         }
