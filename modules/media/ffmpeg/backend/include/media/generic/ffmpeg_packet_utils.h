@@ -2,7 +2,7 @@
 
 #include "media/media_packet.h"
 extern "C" {
-#include <libavcodec/packet.h>
+#include <libavcodec/avcodec.h>
 }
 
 namespace Media {

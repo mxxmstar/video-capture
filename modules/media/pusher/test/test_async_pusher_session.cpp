@@ -13,7 +13,7 @@
 #include <thread>
 
 extern "C" {
-#include <libavcodec/packet.h>
+#include <libavcodec/avcodec.h>
 }
 
 namespace {

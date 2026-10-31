@@ -30,7 +30,7 @@
 
 `common_lib` 只保留公共进程等原有功能，不再隐式提供媒体实现。需要媒体的消费者必须明确链接相应目标。测试也按具体模块链接，而不统一依赖 `common_lib`。x86 的进程实现仍使用 Boost，因此构建整个工程时平台配置仍会查找 Boost；这不代表 `media_core` 或各媒体目标依赖 Boost。独立 Core 验证工程完全不查找这些包。
 
-当前 `MEDIA_FFMPEG_BACKEND=OFF` 只启用 Core；Capture、Pipeline 等非 Core 模块尚未单独支持无 FFmpeg 的配置组合。RK 默认关闭该开关，避免误用设备 FFmpeg 4.2 软件链路。显式要求 RK 启用 FFmpeg 后端会报清晰错误。
+当前 `MEDIA_FFMPEG_FULL=OFF` 只启用 Core；Capture、Pipeline 等非 Core 模块尚未单独支持无 FFmpeg 的配置组合。RK 默认关闭该开关，避免误用设备 FFmpeg 4.2 软件链路。显式要求 RK 启用 FFmpeg 后端会报清晰错误。
 
 ## 目录与接口迁移
 

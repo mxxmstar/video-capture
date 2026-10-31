@@ -1,5 +1,5 @@
 #include "media/generic/ffmpeg_packet_utils.h"
-#include "media/pusher/generic/ffmpeg_muxer.h"
+#include "media/pusher/ffmpeg/ffmpeg_muxer.h"
 #include "common/log/logger.h"
 #include "media/pusher/pusher_config.h"
 #include <cerrno>

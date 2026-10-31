@@ -3,7 +3,7 @@
 #include <chrono>
 #include <mutex>
 
-#include "media/pusher/generic/ffmpeg_muxer.h"
+#include "media/pusher/ffmpeg/ffmpeg_muxer.h"
 #include "media/pusher/i_pusher.h"
 
 struct MuxerError;

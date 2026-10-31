@@ -1,4 +1,4 @@
-#include "media/pusher/generic/ffmpeg_pusher.h"
+#include "media/pusher/ffmpeg/ffmpeg_pusher.h"
 #include "media/generic/ffmpeg_packet_utils.h"
 
 #include <algorithm>
@@ -10,7 +10,7 @@
 #include <utility>
 
 extern "C" {
-#include <libavcodec/packet.h>
+#include <libavcodec/avcodec.h>
 }
 
 namespace {
@@ -228,7 +228,10 @@ PusherResult MapMuxerError(const MuxerError& error, bool network_output) {
                 code == AVERROR(ECONNABORTED) || code == AVERROR(ENETDOWN) ||
                 code == AVERROR(ENETUNREACH) || code == AVERROR(EHOSTUNREACH) ||
                 code == AVERROR(EPIPE) || code == AVERROR_EOF ||
-                code == AVERROR_HTTP_TOO_MANY_REQUESTS || code == AVERROR_HTTP_SERVER_ERROR)) {
+                #ifdef AVERROR_HTTP_TOO_MANY_REQUESTS
+                code == AVERROR_HTTP_TOO_MANY_REQUESTS ||
+#endif
+                code == AVERROR_HTTP_SERVER_ERROR)) {
         category = Category::Network;
         retryable = true;
     }

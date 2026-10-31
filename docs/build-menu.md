@@ -52,7 +52,7 @@ bash scripts/build-menu.sh --platform generic --type Release --action clean
 4. rockchip 模板针对 NanoPC-T4 / RK3399：交叉编译器 GCC12，sysroot 提供设备 GCC10 标准库及 glibc 2.31 ABI。MPP 默认开启、RGA 关闭，按设备准备头文件和库。参见 [Rockchip 说明](../platform/rockchip/README.md)。
 5. 先使用 --dry-run 检查路径，再 --action configure，最后构建。ARM64 程序应在目标设备验证，不在 x86 主机直接运行。
 
-Rockchip 当前 `MEDIA_FFMPEG_BACKEND=OFF`，编译媒体 contracts/core 及其已有测试，不提供完整 FFmpeg 媒体功能；现有 CMake 明确拒绝 rockchip + MEDIA_FFMPEG_BACKEND=ON。仅准备 ARM64 FFmpeg SDK 不会自动实现该后端。
+Rockchip 当前 `MEDIA_FFMPEG_FULL=OFF`，编译媒体 contracts/core 及其已有测试，不提供完整 FFmpeg 媒体功能；现有 CMake 明确拒绝 rockchip + MEDIA_FFMPEG_FULL=ON。仅准备 ARM64 FFmpeg SDK 不会自动实现该后端。
 
 换一台编译主机通常只需调整本机配置；换目标板时必须匹配 CPU、ABI、sysroot、驱动和工具链。当前 NanoPC-T4 工具链固定了设备 ABI，不能通用于所有 ARM64 设备；新芯片平台可能还需要扩展 cmake/Platform.cmake 和平台实现。
 

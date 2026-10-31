@@ -1,4 +1,4 @@
-#include "media/pusher/generic/ffmpeg_pusher.h"
+#include "media/pusher/ffmpeg/ffmpeg_pusher.h"
 
 #include <cerrno>
 #include <filesystem>
@@ -49,7 +49,9 @@ int main() {
         {AVERROR_EXIT, MuxerErrorCategory::Cancelled, PusherErrorCategory::Cancelled, false},
         {AVERROR_HTTP_UNAUTHORIZED, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Authentication, false},
         {AVERROR_HTTP_NOT_FOUND, MuxerErrorCategory::WriteFailed, PusherErrorCategory::NotFound, false},
+#ifdef AVERROR_HTTP_TOO_MANY_REQUESTS
         {AVERROR_HTTP_TOO_MANY_REQUESTS, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Network, true},
+#endif
         {AVERROR_HTTP_SERVER_ERROR, MuxerErrorCategory::WriteFailed, PusherErrorCategory::Network, true},
         {AVERROR_PROTOCOL_NOT_FOUND, MuxerErrorCategory::WriteFailed, PusherErrorCategory::UnsupportedProtocol, false},
         {AVERROR(ENOMEM), MuxerErrorCategory::WriteFailed, PusherErrorCategory::Internal, false},

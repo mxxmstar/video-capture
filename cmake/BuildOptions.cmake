@@ -2,7 +2,13 @@ set(_ffmpeg_default OFF)
 if(EMBEDDED_PLATFORM STREQUAL "generic")
     set(_ffmpeg_default ON)
 endif()
-option(MEDIA_FFMPEG_BACKEND "Build generic FFmpeg media modules" ${_ffmpeg_default})
+
+
+# x86平台编译选项
+option(MEDIA_FFMPEG_FULL "Build the full FFmpeg media pipeline" ${_ffmpeg_default})
+
+# rk平台编译选项
+option(MEDIA_FFMPEG_ROCKCHIP "Build the Rockchip FFmpeg modules (currently pusher and sessions)" OFF)
 option(BUILD_MEDIA "Build media capture, codecs and streaming" ON)
 option(BUILD_RENDER "Build OpenGL rendering" ${EMBEDDED_DEFAULT_BUILD_RENDER})
 option(BUILD_TESTS "Build test programs" ON)
@@ -31,6 +37,6 @@ foreach(kind RUNTIME ARCHIVE LIBRARY)
     endforeach()
 endforeach()
 
-if(BUILD_RENDER AND NOT MEDIA_FFMPEG_BACKEND)
+if(BUILD_RENDER AND NOT MEDIA_FFMPEG_FULL)
     message(FATAL_ERROR "Rendering currently requires the generic media backend")
 endif()

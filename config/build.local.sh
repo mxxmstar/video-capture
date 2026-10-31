@@ -18,7 +18,7 @@ GENERIC_CMAKE_ARGS=(
     "-DCMAKE_TOOLCHAIN_FILE="
     "-DCMAKE_PREFIX_PATH=/home/ub22/vcpkg_env/vcpkg_installed/x64-linux"
     "-DFFMPEG_ROOT=/home/ub22/vcpkg_env/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1"
-    "-DMEDIA_FFMPEG_BACKEND=ON"
+    "-DMEDIA_FFMPEG_FULL=ON"
 )
 
 # Current board profile: NanoPC-T4 / RK3399, Linux ARM64, GCC12 + device ABI.
@@ -27,7 +27,9 @@ ROCKCHIP_CMAKE_ARGS=(
     "-DCMAKE_TOOLCHAIN_FILE=$PROJECT_ROOT/platform/rockchip/toolchains/nanopc-t4-gcc12.cmake"
     "-DNANOPC_SYSROOT=$PROJECT_ROOT/platform/rockchip/sysroots/nanopc-t4"
     "-DROCKCHIP_DEPS_ROOT=$PROJECT_ROOT/platform/rockchip/deps/aarch64"
-    "-DMEDIA_FFMPEG_BACKEND=OFF"
+    "-DMEDIA_FFMPEG_FULL=OFF"
+    "-DMEDIA_FFMPEG_ROCKCHIP=ON"
+    "-DFFMPEG_ROOT=$PROJECT_ROOT/platform/rockchip/deps/aarch64/ffmpeg-board"
     "-DROCKCHIP_WITH_MPP=ON"
     "-DROCKCHIP_WITH_RGA=OFF"
 )
